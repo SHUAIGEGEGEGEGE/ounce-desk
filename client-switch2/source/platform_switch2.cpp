@@ -2,6 +2,8 @@
 
 #include "platform.hpp"
 
+#include <algorithm>
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
 #include <sys/stat.h>
@@ -11,6 +13,7 @@ namespace platform {
 
 namespace {
 bool g_socket_ok = false;
+bool g_nifm_ok = false;
 bool g_pl_ok = false;
 bool g_kbd_ok = false;
 bool g_mouse_ok = false;
@@ -27,7 +30,9 @@ bool init() {
     if (R_SUCCEEDED(socketInitializeDefault())) {
         g_socket_ok = true;
     }
-
+    if (R_SUCCEEDED(nifmInitialize(NifmServiceType_User))) {
+        g_nifm_ok = true;
+    }
     if (R_SUCCEEDED(plInitialize(PlServiceType_User))) {
         g_pl_ok = true;
         if (R_SUCCEEDED(plGetSharedFontByType(&g_shared_font, PlSharedFontType_Standard))) {
@@ -35,7 +40,8 @@ bool init() {
         }
     }
 
-    // Switch 2 (libounce) supports 1920x1080 native touch output ranges
+    // Lock libounce native touch output range to exact 1920x1080 (read directly via hidGetTouchScreenStates,
+    // bypassing switch-sdl2's legacy Switch 1 1280x720 scaling that caused touch drift!)
     hidSetTouchScreenOutputRanges(1920, 1080);
     hidInitializeTouchScreen();
     hidInitializeKeyboard();
@@ -43,7 +49,6 @@ bool init() {
     hidInitializeMouse();
     g_mouse_ok = true;
 
-    // Ensure ASCII-only config directory exists (kaiHEN hides non-ASCII paths in OunceShell/FTP)
     mkdir("sdmc:/switch", 0755);
     mkdir("sdmc:/switch/OunceDesk", 0755);
     return g_socket_ok;
@@ -54,6 +59,10 @@ void shutdown() {
         plExit();
         g_pl_ok = false;
     }
+    if (g_nifm_ok) {
+        nifmExit();
+        g_nifm_ok = false;
+    }
     if (g_socket_ok) {
         socketExit();
         g_socket_ok = false;
@@ -61,23 +70,40 @@ void shutdown() {
 }
 
 bool is_switch_hardware() { return true; }
+bool uses_native_touch() { return true; }
 
 std::string get_config_dir() { return "sdmc:/switch/OunceDesk"; }
 
-bool show_system_keyboard(const std::string& header, const std::string& initial, std::string& out_text, bool numeric_only) {
+uint32_t get_local_ipv4_host_order() {
+    if (!g_nifm_ok) return 0;
+    u32 ip_net = 0;
+    if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ip_net)) && ip_net != 0) {
+        return ntohl(ip_net);
+    }
+    return 0;
+}
+
+bool show_system_keyboard(const std::string& header, const std::string& initial,
+                          std::string& out_text, bool numeric_only, bool password_mode) {
     SwkbdConfig kbd;
     if (R_FAILED(swkbdCreate(&kbd, 0))) {
         return false;
     }
-    swkbdConfigMakePresetDefault(&kbd);
-    if (numeric_only) {
-        swkbdConfigSetType(&kbd, SwkbdType_NumPad);
-        swkbdConfigSetStringLenMax(&kbd, 16);
+    if (password_mode) {
+        swkbdConfigMakePresetPassword(&kbd);
+        swkbdConfigSetStringLenMax(&kbd, 128);
     } else {
-        swkbdConfigSetStringLenMax(&kbd, 256);
+        swkbdConfigMakePresetDefault(&kbd);
+        if (numeric_only) {
+            swkbdConfigSetType(&kbd, SwkbdType_NumPad);
+            swkbdConfigSetStringLenMax(&kbd, 16);
+        } else {
+            swkbdConfigSetType(&kbd, SwkbdType_Normal);
+            swkbdConfigSetStringLenMax(&kbd, 256);
+        }
     }
     swkbdConfigSetHeaderText(&kbd, header.c_str());
-    if (!initial.empty()) {
+    if (!initial.empty() && !password_mode) {
         swkbdConfigSetInitialText(&kbd, initial.c_str());
     }
 
@@ -91,12 +117,27 @@ bool show_system_keyboard(const std::string& header, const std::string& initial,
     return false;
 }
 
+void poll_native_touch(std::vector<NativeTouchPoint>& out_points) {
+    out_points.clear();
+    HidTouchScreenState st{};
+    if (hidGetTouchScreenStates(&st, 1) > 0 && st.count > 0) {
+        int cnt = std::min<int>(st.count, 16);
+        out_points.reserve(static_cast<size_t>(cnt));
+        for (int i = 0; i < cnt; ++i) {
+            const auto& t = st.touches[i];
+            float x = std::max(0.0f, std::min(1920.0f, static_cast<float>(t.x)));
+            float y = std::max(0.0f, std::min(1080.0f, static_cast<float>(t.y)));
+            out_points.push_back({static_cast<uint32_t>(t.finger_id), x, y});
+        }
+    }
+}
+
 static uint8_t convert_hid_modifiers(u64 mods) {
     uint8_t out = 0;
-    if (mods & HidKeyboardModifier_Control) out |= (1 << 0);
-    if (mods & HidKeyboardModifier_Shift)   out |= (1 << 1);
-    if (mods & HidKeyboardModifier_LeftAlt) out |= (1 << 2);
-    if (mods & HidKeyboardModifier_Gui)     out |= (1 << 3);
+    if (mods & HidKeyboardModifier_Control)  out |= (1 << 0);
+    if (mods & HidKeyboardModifier_Shift)    out |= (1 << 1);
+    if (mods & HidKeyboardModifier_LeftAlt)  out |= (1 << 2);
+    if (mods & HidKeyboardModifier_Gui)      out |= (1 << 3);
     if (mods & HidKeyboardModifier_RightAlt) out |= (1 << 6);
     return out;
 }

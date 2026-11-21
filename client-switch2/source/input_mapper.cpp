@@ -55,115 +55,142 @@ void InputMapper::send_cursor(RemoteBackend& backend) {
     backend.send_mouse_abs(vp_.cursor_x, vp_.cursor_y);
 }
 
-bool InputMapper::handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_toggle_osk) {
-    out_toggle_osk = false;
+bool InputMapper::on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBackend& backend) {
+    fingers_[finger_id] = {sx, sy, sx, sy, platform::now_us(), false};
+    if (fingers_.size() >= 3) {
+        if (direct_dragging_) {
+            backend.send_mouse_button(MouseBtn::LEFT, false);
+            direct_dragging_ = false;
+        }
+        fingers_.clear();
+        two_finger_gesture_ = false;
+        return true;  // 3-finger tap opens Menu
+    }
+    if (fingers_.size() == 2) {
+        if (direct_dragging_) {
+            backend.send_mouse_button(MouseBtn::LEFT, false);
+            direct_dragging_ = false;
+        }
+        two_finger_gesture_ = true;
+        auto it = fingers_.begin();
+        const auto& f0 = it->second;
+        ++it;
+        const auto& f1 = it->second;
+        prev_pinch_dist_ = std::hypot(f1.x - f0.x, f1.y - f0.y);
+        prev_two_mid_x_ = 0.5f * (f0.x + f1.x);
+        prev_two_mid_y_ = 0.5f * (f0.y + f1.y);
+    } else if (fingers_.size() == 1 && touch_mode_ == TouchMode::TOUCH) {
+        float nx, ny;
+        if (screen_to_norm(sx, sy, nx, ny)) {
+            vp_.cursor_x = nx;
+            vp_.cursor_y = ny;
+            send_cursor(backend);
+            backend.send_mouse_button(MouseBtn::LEFT, true);
+            direct_dragging_ = true;
+        }
+    }
+    return false;
+}
+
+void InputMapper::on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBackend& backend, int win_w, int win_h) {
+    auto it = fingers_.find(finger_id);
+    if (it == fingers_.end()) return;
+    float dx = sx - it->second.x;
+    float dy = sy - it->second.y;
+    it->second.x = sx;
+    it->second.y = sy;
+    if (std::hypot(sx - it->second.start_x, sy - it->second.start_y) > 14.0f) {
+        it->second.moved = true;
+    }
+
+    if (fingers_.size() == 2) {
+        auto fit = fingers_.begin();
+        const auto& f0 = fit->second;
+        ++fit;
+        const auto& f1 = fit->second;
+        float dist = std::hypot(f1.x - f0.x, f1.y - f0.y);
+        float mid_x = 0.5f * (f0.x + f1.x);
+        float mid_y = 0.5f * (f0.y + f1.y);
+        float ddist = dist - prev_pinch_dist_;
+        float dmx = mid_x - prev_two_mid_x_;
+        float dmy = mid_y - prev_two_mid_y_;
+
+        if (std::fabs(ddist) > 12.0f && prev_pinch_dist_ > 20.0f) {
+            vp_.zoom = clampf(vp_.zoom * (dist / prev_pinch_dist_), 1.0f, 3.0f);
+            prev_pinch_dist_ = dist;
+        } else if (std::fabs(dmx) > 2.0f || std::fabs(dmy) > 2.0f) {
+            if (vp_.zoom > 1.05f) {
+                vp_.pan_x = clampf(vp_.pan_x - dmx / (win_w * vp_.zoom), 0.1f, 0.9f);
+                vp_.pan_y = clampf(vp_.pan_y - dmy / (win_h * vp_.zoom), 0.1f, 0.9f);
+            } else {
+                backend.send_mouse_wheel(static_cast<int16_t>(dmx * 3.0f), static_cast<int16_t>(dmy * 3.5f));
+            }
+        }
+        prev_two_mid_x_ = mid_x;
+        prev_two_mid_y_ = mid_y;
+    } else if (fingers_.size() == 1) {
+        if (touch_mode_ == TouchMode::MOUSE) {
+            // Trackpad-style precision mouse movement with smooth acceleration
+            float speed = std::hypot(dx, dy);
+            float accel = 1.0f + clampf(speed / 28.0f, 0.0f, 1.4f);
+            vp_.cursor_x += (dx * accel) / static_cast<float>(std::max(1, vp_.dst_rect.w));
+            vp_.cursor_y += (dy * accel) / static_cast<float>(std::max(1, vp_.dst_rect.h));
+            send_cursor(backend);
+        } else if (direct_dragging_) {
+            // Exact 1:1 direct touch drag
+            float nx, ny;
+            if (screen_to_norm(sx, sy, nx, ny)) {
+                vp_.cursor_x = nx;
+                vp_.cursor_y = ny;
+                send_cursor(backend);
+            }
+        }
+    }
+}
+
+void InputMapper::on_touch_up(uint64_t finger_id, RemoteBackend& backend) {
+    auto it = fingers_.find(finger_id);
+    if (it != fingers_.end()) {
+        uint64_t held_us = platform::now_us() - it->second.down_us;
+        bool was_tap = !it->second.moved && held_us < 280000ULL;
+        if (direct_dragging_) {
+            backend.send_mouse_button(MouseBtn::LEFT, false);
+            direct_dragging_ = false;
+        } else if (two_finger_gesture_ && fingers_.size() == 2 && was_tap) {
+            // 2-finger tap = Right Click (works in both Touch & Mouse modes!)
+            backend.send_mouse_button(MouseBtn::RIGHT, true);
+            backend.send_mouse_button(MouseBtn::RIGHT, false);
+        } else if (!two_finger_gesture_ && fingers_.size() == 1 && touch_mode_ == TouchMode::MOUSE && was_tap) {
+            // 1-finger tap in Mouse mode = Left Click
+            backend.send_mouse_button(MouseBtn::LEFT, true);
+            backend.send_mouse_button(MouseBtn::LEFT, false);
+        }
+        fingers_.erase(it);
+    }
+    if (fingers_.empty()) two_finger_gesture_ = false;
+}
+
+bool InputMapper::handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_open_swkbd) {
+    out_open_swkbd = false;
 
     switch (ev.type) {
-        case SDL_FINGERDOWN: {
-            float sx = ev.tfinger.x * win_w;
-            float sy = ev.tfinger.y * win_h;
-            fingers_[ev.tfinger.fingerId] = {sx, sy, sx, sy, platform::now_us(), false};
-            if (fingers_.size() == 3) {
-                fingers_.clear();
-                return true;  // 3-finger tap opens Quick Overlay Menu
-            }
-            if (fingers_.size() == 2) {
-                two_finger_gesture_ = true;
-                auto it = fingers_.begin();
-                const auto& f0 = it->second;
-                ++it;
-                const auto& f1 = it->second;
-                prev_pinch_dist_ = std::hypot(f1.x - f0.x, f1.y - f0.y);
-                prev_two_mid_x_ = 0.5f * (f0.x + f1.x);
-                prev_two_mid_y_ = 0.5f * (f0.y + f1.y);
-            } else if (fingers_.size() == 1 && touch_mode_ == TouchMode::DIRECT) {
-                float nx, ny;
-                if (screen_to_norm(sx, sy, nx, ny)) {
-                    vp_.cursor_x = nx;
-                    vp_.cursor_y = ny;
-                    send_cursor(backend);
-                    backend.send_mouse_button(MouseBtn::LEFT, true);
-                    direct_dragging_ = true;
-                }
+        case SDL_FINGERDOWN:
+            if (!platform::uses_native_touch()) {
+                return on_touch_down(static_cast<uint64_t>(ev.tfinger.fingerId),
+                                     ev.tfinger.x * win_w, ev.tfinger.y * win_h, backend);
             }
             break;
-        }
-        case SDL_FINGERMOTION: {
-            auto it = fingers_.find(ev.tfinger.fingerId);
-            if (it == fingers_.end()) break;
-            float sx = ev.tfinger.x * win_w;
-            float sy = ev.tfinger.y * win_h;
-            float dx = sx - it->second.x;
-            float dy = sy - it->second.y;
-            it->second.x = sx;
-            it->second.y = sy;
-            if (std::hypot(sx - it->second.start_x, sy - it->second.start_y) > 14.0f) {
-                it->second.moved = true;
-            }
-
-            if (fingers_.size() == 2) {
-                auto fit = fingers_.begin();
-                const auto& f0 = fit->second;
-                ++fit;
-                const auto& f1 = fit->second;
-                float dist = std::hypot(f1.x - f0.x, f1.y - f0.y);
-                float mid_x = 0.5f * (f0.x + f1.x);
-                float mid_y = 0.5f * (f0.y + f1.y);
-                float ddist = dist - prev_pinch_dist_;
-                float dmx = mid_x - prev_two_mid_x_;
-                float dmy = mid_y - prev_two_mid_y_;
-
-                if (std::fabs(ddist) > 12.0f && prev_pinch_dist_ > 20.0f) {
-                    vp_.zoom = clampf(vp_.zoom * (dist / prev_pinch_dist_), 1.0f, 3.0f);
-                    prev_pinch_dist_ = dist;
-                } else if (std::fabs(dmx) > 2.0f || std::fabs(dmy) > 2.0f) {
-                    if (vp_.zoom > 1.05f) {
-                        vp_.pan_x = clampf(vp_.pan_x - dmx / (win_w * vp_.zoom), 0.1f, 0.9f);
-                        vp_.pan_y = clampf(vp_.pan_y - dmy / (win_h * vp_.zoom), 0.1f, 0.9f);
-                    } else {
-                        backend.send_mouse_wheel(static_cast<int16_t>(dmx * 3.0f), static_cast<int16_t>(dmy * 3.5f));
-                    }
-                }
-                prev_two_mid_x_ = mid_x;
-                prev_two_mid_y_ = mid_y;
-            } else if (fingers_.size() == 1) {
-                if (touch_mode_ == TouchMode::TRACKPAD) {
-                    float speed = std::hypot(dx, dy);
-                    float accel = 1.0f + clampf(speed / 28.0f, 0.0f, 1.4f);
-                    vp_.cursor_x += (dx * accel) / static_cast<float>(std::max(1, vp_.dst_rect.w));
-                    vp_.cursor_y += (dy * accel) / static_cast<float>(std::max(1, vp_.dst_rect.h));
-                    send_cursor(backend);
-                } else if (direct_dragging_) {
-                    float nx, ny;
-                    if (screen_to_norm(sx, sy, nx, ny)) {
-                        vp_.cursor_x = nx;
-                        vp_.cursor_y = ny;
-                        send_cursor(backend);
-                    }
-                }
+        case SDL_FINGERMOTION:
+            if (!platform::uses_native_touch()) {
+                on_touch_move(static_cast<uint64_t>(ev.tfinger.fingerId),
+                              ev.tfinger.x * win_w, ev.tfinger.y * win_h, backend, win_w, win_h);
             }
             break;
-        }
-        case SDL_FINGERUP: {
-            auto it = fingers_.find(ev.tfinger.fingerId);
-            if (it != fingers_.end()) {
-                uint64_t held_us = platform::now_us() - it->second.down_us;
-                bool was_tap = !it->second.moved && held_us < 280000ULL;
-                if (direct_dragging_) {
-                    backend.send_mouse_button(MouseBtn::LEFT, false);
-                    direct_dragging_ = false;
-                } else if (two_finger_gesture_ && fingers_.size() == 2 && was_tap) {
-                    backend.send_mouse_button(MouseBtn::RIGHT, true);
-                    backend.send_mouse_button(MouseBtn::RIGHT, false);
-                } else if (!two_finger_gesture_ && fingers_.size() == 1 && touch_mode_ == TouchMode::TRACKPAD && was_tap) {
-                    backend.send_mouse_button(MouseBtn::LEFT, true);
-                    backend.send_mouse_button(MouseBtn::LEFT, false);
-                }
-                fingers_.erase(it);
+        case SDL_FINGERUP:
+            if (!platform::uses_native_touch()) {
+                on_touch_up(static_cast<uint64_t>(ev.tfinger.fingerId), backend);
             }
-            if (fingers_.empty()) two_finger_gesture_ = false;
             break;
-        }
         case SDL_MOUSEMOTION: {
             if (!platform::is_switch_hardware()) {
                 float nx, ny;
@@ -211,7 +238,7 @@ bool InputMapper::handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, 
         }
         case SDL_CONTROLLERBUTTONDOWN: {
             if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) toggle_touch_mode();
-            else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_X) out_toggle_osk = true;
+            else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_X) out_open_swkbd = true;
             else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) backend.send_key(82, true, 0);
             else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) backend.send_key(81, true, 0);
             else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT) backend.send_key(80, true, 0);
@@ -316,11 +343,11 @@ void InputMapper::send_shortcut(RemoteBackend& backend, ProtocolType proto, cons
         if (is_mac) send_combo(backend, 227, RD_MOD_LMETA, 43);
         else send_combo(backend, 226, RD_MOD_LALT, 43);
     } else if (action == "launcher") {
-        if (is_mac) send_combo(backend, 227, RD_MOD_LMETA, 44);  // Cmd+Space Spotlight
+        if (is_mac) send_combo(backend, 227, RD_MOD_LMETA, 44);
         else { backend.send_key(227, true, RD_MOD_LMETA); backend.send_key(227, false, 0); }
     } else if (action == "desktop") {
-        if (is_mac) send_combo(backend, 224, RD_MOD_LCTRL, 82);  // Mission Control
-        else send_combo(backend, 227, RD_MOD_LMETA, 7);          // Win+D
+        if (is_mac) send_combo(backend, 224, RD_MOD_LCTRL, 82);
+        else send_combo(backend, 227, RD_MOD_LMETA, 7);
     } else if (action == "taskmgr") {
         if (is_mac) {
             backend.send_key(227, true, RD_MOD_LMETA);

@@ -7,6 +7,15 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <ws2tcpip.h>
+using socklen_t = int;
+#define CLOSE_SOCK closesocket
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#define CLOSE_SOCK close
 #endif
 
 namespace platform {
@@ -30,12 +39,35 @@ void shutdown() {
 }
 
 bool is_switch_hardware() { return false; }
+bool uses_native_touch() { return false; }
 
 std::string get_config_dir() { return "config"; }
 
-bool show_system_keyboard(const std::string&, const std::string&, std::string&, bool) {
-    // Desktop simulator uses built-in PIN/OSK + physical keyboard
+uint32_t get_local_ipv4_host_order() {
+    int s = static_cast<int>(socket(AF_INET, SOCK_DGRAM, 0));
+    if (s < 0) return 0;
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
+    uint32_t out = 0;
+    if (connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+        sockaddr_in local{};
+        socklen_t len = sizeof(local);
+        if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+            out = ntohl(local.sin_addr.s_addr);
+        }
+    }
+    CLOSE_SOCK(s);
+    return out;
+}
+
+bool show_system_keyboard(const std::string&, const std::string&, std::string&, bool, bool) {
     return false;
+}
+
+void poll_native_touch(std::vector<NativeTouchPoint>& out_points) {
+    out_points.clear();
 }
 
 void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTransition>& out_keys) {

@@ -21,25 +21,36 @@ struct PhysicalKeyTransition {
     uint8_t modifiers = 0;
 };
 
+struct NativeTouchPoint {
+    uint32_t id = 0;
+    float x = 0.0f;  // Exact logical pixel X in 0..1920
+    float y = 0.0f;  // Exact logical pixel Y in 0..1080
+};
+
 bool init();
 void shutdown();
 
-// Returns true if running on Switch 2 handheld/docked hardware
 bool is_switch_hardware();
+bool uses_native_touch();
 
 // ASCII-only config directory (sdmc:/switch/OunceDesk on Switch 2, ./config on Desktop)
 std::string get_config_dir();
 
-// Native system software keyboard (swkbd on Switch 2; returns false on Desktop to use OSK)
-bool show_system_keyboard(const std::string& header, const std::string& initial, std::string& out_text, bool numeric_only = false);
+// Local LAN IPv4 address in host byte order (e.g. 192.168.1.42 -> 0xC0A8012A), 0 if unavailable
+uint32_t get_local_ipv4_host_order();
 
-// Poll native USB/BT keyboard & mouse attached to Switch 2 (no-op on Desktop where SDL handles them)
+// Native Switch 2 software keyboard (swkbd)
+bool show_system_keyboard(const std::string& header, const std::string& initial,
+                          std::string& out_text, bool numeric_only = false, bool password_mode = false);
+
+// Poll exact 1:1 1920x1080 native touch points from libounce hidGetTouchScreenStates
+void poll_native_touch(std::vector<NativeTouchPoint>& out_points);
+
+// Poll native USB/BT keyboard & mouse attached to Switch 2
 void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTransition>& out_keys);
 
-// Monotonic time in microseconds
 uint64_t now_us();
 
-// Optional system shared TrueType font buffer (Switch 2 plGetSharedFontByType)
 bool get_shared_font(const void*& out_ptr, size_t& out_size);
 
 }  // namespace platform

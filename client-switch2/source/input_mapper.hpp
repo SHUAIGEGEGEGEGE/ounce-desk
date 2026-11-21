@@ -9,8 +9,8 @@
 #include <string>
 
 enum class TouchMode {
-    TRACKPAD,  // 1-finger drag/tap=LClick, 2-finger tap=RClick, 2-finger drag=Scroll, pinch=Zoom
-    DIRECT,    // Direct touch on desktop pixel
+    TOUCH,  // Direct 1:1 touch mode (tap & drag directly where finger touches)
+    MOUSE,  // Mouse / trackpad mode (1-finger trackpad + cursor arrow + stick mouse)
 };
 
 struct ViewportState {
@@ -26,10 +26,15 @@ class InputMapper {
 public:
     InputMapper() = default;
 
-    void set_touch_mode(TouchMode mode) { touch_mode_ = mode; }
+    void set_touch_mode(TouchMode mode) {
+        touch_mode_ = mode;
+        fingers_.clear();
+        direct_dragging_ = false;
+        two_finger_gesture_ = false;
+    }
     TouchMode touch_mode() const { return touch_mode_; }
     void toggle_touch_mode() {
-        touch_mode_ = (touch_mode_ == TouchMode::TRACKPAD) ? TouchMode::DIRECT : TouchMode::TRACKPAD;
+        set_touch_mode((touch_mode_ == TouchMode::TOUCH) ? TouchMode::MOUSE : TouchMode::TOUCH);
     }
 
     ViewportState& viewport() { return vp_; }
@@ -43,12 +48,20 @@ public:
 
     void update_viewport_rect(int win_w, int win_h, int fb_w, int fb_h);
 
-    bool handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_toggle_osk);
+    // Exact 1:1 logical pixel (0..1920, 0..1080) touch handlers (used by native Switch 2 hidGetTouchScreenStates & Desktop SDL)
+    // Returns true if 3-finger gesture requests opening the Menu.
+    bool on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBackend& backend);
+    void on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBackend& backend, int win_w, int win_h);
+    void on_touch_up(uint64_t finger_id, RemoteBackend& backend);
+
+    // Handle SDL events while in active STREAMING state
+    bool handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_open_swkbd);
+
     void update_frame(float dt_sec, SDL_GameController* pad, RemoteBackend& backend);
     void send_shortcut(RemoteBackend& backend, ProtocolType proto, const std::string& action);
 
 private:
-    TouchMode touch_mode_ = TouchMode::TRACKPAD;
+    TouchMode touch_mode_ = TouchMode::TOUCH;
     ViewportState vp_;
 
     struct FingerInfo {
@@ -57,7 +70,7 @@ private:
         uint64_t down_us = 0;
         bool moved = false;
     };
-    std::map<SDL_FingerID, FingerInfo> fingers_;
+    std::map<uint64_t, FingerInfo> fingers_;
     float prev_pinch_dist_ = 0.0f;
     float prev_two_mid_x_ = 0.0f;
     float prev_two_mid_y_ = 0.0f;
