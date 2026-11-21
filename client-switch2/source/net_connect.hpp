@@ -162,6 +162,10 @@ inline int tcp_connect(const std::string& host_in, uint16_t port_in, int timeout
         set_nb(s, false);
         int one = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+        int rcv_buf = 1024 * 1024;
+        int snd_buf = 256 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv_buf), sizeof(rcv_buf));
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd_buf), sizeof(snd_buf));
 #ifdef _WIN32
         DWORD tvv = 5000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tvv), sizeof(tvv));

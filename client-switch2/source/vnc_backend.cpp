@@ -123,22 +123,52 @@ bool VncBackend::send_all(const uint8_t* data, size_t len) {
 }
 
 bool VncBackend::recv_all(uint8_t* data, size_t len) {
+    if (rx_cache_.empty()) rx_cache_.resize(65536);
+
     size_t got = 0;
     while (got < len && !stop_.load()) {
-        int n = static_cast<int>(recv(sock_, reinterpret_cast<char*>(data + got), static_cast<int>(len - got), 0));
-        if (n > 0) {
-            got += static_cast<size_t>(n);
-            rx_bytes_.fetch_add(static_cast<uint64_t>(n));
-        } else if (n == 0) {
-            return false;
-        } else {
+        if (rx_pos_ < rx_len_) {
+            size_t avail = rx_len_ - rx_pos_;
+            size_t take = std::min(avail, len - got);
+            std::memcpy(data + got, rx_cache_.data() + rx_pos_, take);
+            rx_pos_ += take;
+            got += take;
+            if (got == len) return true;
+        }
+        if (len - got >= 8192) {
+            int n = static_cast<int>(recv(sock_, reinterpret_cast<char*>(data + got), static_cast<int>(len - got), 0));
+            if (n > 0) {
+                got += static_cast<size_t>(n);
+                rx_bytes_.fetch_add(static_cast<uint64_t>(n));
+            } else if (n == 0) {
+                return false;
+            } else {
 #ifdef _WIN32
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
 #endif
-            return false;
+                return false;
+            }
+        } else {
+            rx_pos_ = 0;
+            rx_len_ = 0;
+            int n = static_cast<int>(recv(sock_, reinterpret_cast<char*>(rx_cache_.data()), static_cast<int>(rx_cache_.size()), 0));
+            if (n > 0) {
+                rx_len_ = static_cast<size_t>(n);
+                rx_bytes_.fetch_add(static_cast<uint64_t>(n));
+            } else if (n == 0) {
+                return false;
+            } else {
+#ifdef _WIN32
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
+#else
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+#endif
+                return false;
+            }
         }
     }
     return got == len;
@@ -171,8 +201,9 @@ bool VncBackend::sync_texture(SDL_Renderer* renderer, SDL_Texture*& io_texture, 
     out_w = fb_w_;
     out_h = fb_h_;
     if (!io_texture) return false;
+    if (in_fb_batch_ && !full_dirty_) return false;
 
-    if (full_dirty_) {
+    if (full_dirty_ || dirty_rects_.size() > 8) {
         SDL_UpdateTexture(io_texture, nullptr, fb_rgba_.data(), fb_w_ * 4);
         full_dirty_ = false;
         dirty_rects_.clear();
@@ -501,6 +532,8 @@ void VncBackend::run_session() {
             CLOSE_SOCK(sock_);
             sock_ = -1;
         }
+        rx_pos_ = 0;
+        rx_len_ = 0;
         std::string cerr, caddr;
         int s = netc::tcp_connect(profile_.host, profile_.port, 6000, cerr, &caddr);
         if (s < 0) {
@@ -700,6 +733,14 @@ void VncBackend::run_session() {
             uint8_t hdr[3];
             if (!recv_all(hdr, 3)) break;
             uint16_t nrects = be16(hdr + 1);
+            // Send next incremental FramebufferUpdateRequest IMMEDIATELY so server overlaps encoding
+            // the next frame while we decode the current frame's rectangles (eliminates 1x RTT stall per frame!)
+            bool full = want_full_refresh_.exchange(false);
+            send_fb_update_request(!full);
+            {
+                std::lock_guard<std::mutex> lk(fb_mu_);
+                in_fb_batch_ = true;
+            }
             for (uint16_t i = 0; i < nrects && !stop_.load(); ++i) {
                 uint8_t rhdr[12];
                 if (!recv_all(rhdr, 12)) { stop_.store(true); break; }
@@ -750,9 +791,11 @@ void VncBackend::run_session() {
                     break;
                 }
             }
+            {
+                std::lock_guard<std::mutex> lk(fb_mu_);
+                in_fb_batch_ = false;
+            }
             ++frames_win;
-            bool full = want_full_refresh_.exchange(false);
-            send_fb_update_request(!full);
         } else if (msg_type == 1) {
             // SetColourMapEntries (skip)
             uint8_t h[5];

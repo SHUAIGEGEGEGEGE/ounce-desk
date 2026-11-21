@@ -324,6 +324,139 @@ bool decompress_planar(const uint8_t* src, size_t src_len, int width, int height
     return true;
 }
 
+// MS-RDPNSC 2.2.2.2 NSCodec Bitmap Stream Decompressor (Windows 10/11 modern high-speed SurfaceBits codec!).
+// Decodes AYCoCg RLE/raw planes -> stored (bottom-up) ABGR8888 pixels.
+bool nsc_rle_decode_plane(const uint8_t* in, size_t in_size, uint8_t* out, uint32_t orig_size) {
+    uint32_t left = orig_size;
+    while (left > 4) {
+        if (in_size < 1) return false;
+        --in_size;
+        uint8_t value = *in++;
+        if (left == 5) {
+            *out++ = value;
+            --left;
+        } else {
+            if (in_size < 1) return false;
+            if (value == *in) {
+                --in_size;
+                ++in;
+                if (in_size < 1) return false;
+                uint32_t run_len = 0;
+                if (*in < 0xFF) {
+                    --in_size;
+                    run_len = static_cast<uint32_t>(*in++) + 2u;
+                } else {
+                    if (in_size < 5) return false;
+                    in_size -= 5;
+                    ++in;
+                    run_len = le32(in);
+                    in += 4;
+                }
+                if (left < run_len) return false;
+                std::memset(out, value, run_len);
+                out += run_len;
+                left -= run_len;
+            } else {
+                *out++ = value;
+                --left;
+            }
+        }
+    }
+    if (left < 4 || in_size < 4) return false;
+    std::memcpy(out, in, 4);
+    return true;
+}
+
+bool decompress_nscodec(const uint8_t* src, size_t src_len, int width, int height,
+                        std::vector<uint32_t>& out_rgba) {
+    if (src_len < 20 || width <= 0 || height <= 0) return false;
+    uint32_t plane_bytes[4];
+    size_t total_planes = 0;
+    for (int i = 0; i < 4; ++i) {
+        plane_bytes[i] = le32(src + i * 4);
+        total_planes += plane_bytes[i];
+    }
+    uint8_t color_loss = src[16];
+    uint8_t chroma_sub = src[17];
+    if (color_loss < 1 || color_loss > 7) return false;
+    if (20 + total_planes > src_len) return false;
+
+    const uint32_t rw = static_cast<uint32_t>((width + 7) & ~7);
+    const uint32_t rh = static_cast<uint32_t>((height + 1) & ~1);
+    const size_t max_plane = static_cast<size_t>(rw) * rh;
+    if (max_plane == 0 || max_plane > 64u * 1024u * 1024u) return false;
+
+    uint32_t orig_bytes[4];
+    for (int i = 0; i < 4; ++i) orig_bytes[i] = static_cast<uint32_t>(width) * height;
+    if (chroma_sub) {
+        orig_bytes[0] = rw * static_cast<uint32_t>(height);
+        orig_bytes[1] = (rw >> 1) * (rh >> 1);
+        orig_bytes[2] = orig_bytes[1];
+    }
+
+    thread_local std::vector<uint8_t> planes[4];
+    for (int i = 0; i < 4; ++i) {
+        if (planes[i].size() < max_plane) planes[i].resize(max_plane);
+    }
+
+    const uint8_t* rle = src + 20;
+    size_t rle_rem = total_planes;
+    for (int i = 0; i < 4; ++i) {
+        uint32_t psize = plane_bytes[i];
+        uint32_t osize = orig_bytes[i];
+        if (rle_rem < psize || osize > max_plane) return false;
+        if (psize == 0) {
+            std::memset(planes[i].data(), 0xFF, osize);
+        } else if (psize < osize) {
+            if (!nsc_rle_decode_plane(rle, psize, planes[i].data(), osize)) return false;
+        } else {
+            std::memcpy(planes[i].data(), rle, osize);
+        }
+        rle += psize;
+        rle_rem -= psize;
+    }
+
+    const uint8_t shift = static_cast<uint8_t>(color_loss - 1);
+    out_rgba.resize(static_cast<size_t>(width) * height);
+
+    auto clamp8 = [](int v) -> uint8_t {
+        return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    };
+
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* yp  = chroma_sub ? (planes[0].data() + static_cast<size_t>(y) * rw)
+                                        : (planes[0].data() + static_cast<size_t>(y) * width);
+        const uint8_t* cop = chroma_sub ? (planes[1].data() + static_cast<size_t>(y >> 1) * (rw >> 1))
+                                        : (planes[1].data() + static_cast<size_t>(y) * width);
+        const uint8_t* cgp = chroma_sub ? (planes[2].data() + static_cast<size_t>(y >> 1) * (rw >> 1))
+                                        : (planes[2].data() + static_cast<size_t>(y) * width);
+        uint32_t* dst_row = out_rgba.data() + static_cast<size_t>(y) * width;
+
+        if (chroma_sub) {
+            for (int x = 0; x < width; ++x) {
+                int yv  = yp[x];
+                int cov = static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>(cop[x >> 1] << shift)));
+                int cgv = static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>(cgp[x >> 1] << shift)));
+                uint8_t r = clamp8(yv + cov - cgv);
+                uint8_t g = clamp8(yv + cgv);
+                uint8_t b = clamp8(yv - cov - cgv);
+                dst_row[x] = uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | 0xFF000000u;
+            }
+        } else {
+            for (int x = 0; x < width; ++x) {
+                int yv  = yp[x];
+                int cov = static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>(cop[x] << shift)));
+                int cgv = static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>(cgp[x] << shift)));
+                uint8_t r = clamp8(yv + cov - cgv);
+                uint8_t g = clamp8(yv + cgv);
+                uint8_t b = clamp8(yv - cov - cgv);
+                dst_row[x] = uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | 0xFF000000u;
+            }
+        }
+    }
+    return true;
+}
+
 // Custom mbedTLS TCP BIO callbacks
 int bio_tcp_send(void* ctx, const unsigned char* buf, size_t len) {
     int sock = *static_cast<int*>(ctx);
@@ -528,6 +661,11 @@ void RdpBackend::teardown_tls() {
         tls_inited_ = false;
     }
     use_tls_ = false;
+    rx_pos_ = 0;
+    rx_len_ = 0;
+    in_surface_frame_ = false;
+    pending_frame_rects_.clear();
+    pending_full_dirty_ = false;
 }
 
 void RdpBackend::disconnect() {
@@ -597,16 +735,45 @@ bool RdpBackend::transport_send(const uint8_t* data, size_t len) {
 bool RdpBackend::transport_recv(uint8_t* data, size_t len) {
     if (sock_ < 0) return false;
     if (!use_tls_) return raw_recv_all(data, len);
+
+    if (rx_cache_.empty()) rx_cache_.resize(65536);
+
     size_t got = 0;
     while (got < len && !stop_.load()) {
-        int n = mbedtls_ssl_read(&ssl_, data + got, len - got);
-        if (n > 0) {
-            got += static_cast<size_t>(n);
-            rx_bytes_.fetch_add(static_cast<uint64_t>(n));
-        } else if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            continue;
+        // 1. Drain userland read-ahead cache first (zero syscalls for 1-byte/2-byte FastPath headers!)
+        if (rx_pos_ < rx_len_) {
+            size_t avail = rx_len_ - rx_pos_;
+            size_t take = std::min(avail, len - got);
+            std::memcpy(data + got, rx_cache_.data() + rx_pos_, take);
+            rx_pos_ += take;
+            got += take;
+            if (got == len) return true;
+        }
+
+        // 2. Large remaining chunk -> read directly into caller buffer
+        if (len - got >= 8192) {
+            int n = mbedtls_ssl_read(&ssl_, data + got, len - got);
+            if (n > 0) {
+                got += static_cast<size_t>(n);
+                rx_bytes_.fetch_add(static_cast<uint64_t>(n));
+            } else if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                continue;
+            } else {
+                return false;
+            }
         } else {
-            return false;
+            // 3. Refill 64KB userland cache in one TLS record read
+            rx_pos_ = 0;
+            rx_len_ = 0;
+            int n = mbedtls_ssl_read(&ssl_, rx_cache_.data(), rx_cache_.size());
+            if (n > 0) {
+                rx_len_ = static_cast<size_t>(n);
+                rx_bytes_.fetch_add(static_cast<uint64_t>(n));
+            } else if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                continue;
+            } else {
+                return false;
+            }
         }
     }
     return got == len;
@@ -1130,10 +1297,15 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
     if (server_originator_id == 0) server_originator_id = 0x03EA;
     share_id_ = le32(pdu + 6);
 
-    // Parse server Demand Active capability sets to echo preferredBitsPerPixel
+    // Parse server Demand Active capability sets to echo preferredBitsPerPixel & modern Surface/Codec caps
     uint16_t server_bpp = 32;
     uint16_t srv_w = profile_.req_width;
     uint16_t srv_h = profile_.req_height;
+    bool srv_has_multifrag = false;
+    bool srv_has_surfcmds = false;
+    bool srv_has_codecs = false;
+    bool srv_has_frame_ack = false;
+    bool srv_has_large_ptr = false;
     uint16_t cb_src_desc = le16(pdu + 10);
     uint16_t cb_combined_caps = le16(pdu + 12);
     size_t caps_off = 14 + static_cast<size_t>(cb_src_desc);
@@ -1155,14 +1327,29 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
                     srv_w = sw;
                     srv_h = sh;
                 }
+            } else if (ctype == 0x001A) {
+                srv_has_multifrag = true;
+            } else if (ctype == 0x001B) {
+                srv_has_large_ptr = true;
+            } else if (ctype == 0x001C) {
+                srv_has_surfcmds = true;
+            } else if (ctype == 0x001D) {
+                srv_has_codecs = true;
+            } else if (ctype == 0x001E) {
+                srv_has_frame_ack = true;
             }
             cpos += clen;
         }
     }
+    srv_frame_ack_ = srv_has_frame_ack;
 
     platform::log_line("[RDP] Received DemandActive: shareId=" + std::to_string(share_id_) +
                        " originator=" + std::to_string(server_originator_id) +
-                       " serverBpp=" + std::to_string(server_bpp));
+                       " serverBpp=" + std::to_string(server_bpp) +
+                       " surf=" + std::to_string(srv_has_surfcmds) +
+                       " codecs=" + std::to_string(srv_has_codecs) +
+                       " multifrag=" + std::to_string(srv_has_multifrag) +
+                       " frameAck=" + std::to_string(srv_has_frame_ack));
 
     // Build Client Confirm Active PDU with all 16 mandatory MS-RDPBCGR capability sets
     // (Matches FreeRDP rdp_write_confirm_active so Windows rdpcorets StateExpectingCA succeeds!)
@@ -1330,6 +1517,49 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
         push_le32(c, 1600);  // VCChunkSize = 1600
         add_cap(0x0014, c);
     }
+    // 17. CAPSETTYPE_LARGE_POINTER (0x001B) - if offered by server
+    if (srv_has_large_ptr) {
+        std::vector<uint8_t> c;
+        push_le16(c, 1);  // largePointerSupportFlags = LARGE_POINTER_FLAG_96x96
+        add_cap(0x001B, c);
+    }
+    // 18. CAPSETTYPE_MULTIFRAGMENTUPDATE (0x001A) - unlocks full-frame Fast-Path updates instead of tiny strips!
+    if (srv_has_multifrag) {
+        std::vector<uint8_t> c;
+        push_le32(c, 8u * 1024u * 1024u);  // MaxRequestSize = 8 MB
+        add_cap(0x001A, c);
+    }
+    // 19. CAPSETTYPE_SURFACE_COMMANDS (0x001C) - enables modern SurfaceBits + atomic FrameMarker!
+    if (srv_has_surfcmds && srv_has_multifrag) {
+        std::vector<uint8_t> c;
+        // cmdFlags: SURFCMDS_SET_SURFACE_BITS (0x02) | SURFCMDS_FRAME_MARKER (0x10) | SURFCMDS_STREAM_SURFACE_BITS (0x40)
+        push_le32(c, 0x00000052u);
+        push_le32(c, 0);  // reserved
+        add_cap(0x001C, c);
+    }
+    // 20. CAPSETTYPE_BITMAP_CODECS (0x001D) - advertises NSCodec (AYCoCg 4:2:0 RLE, 5-10x faster than GDI strips!)
+    if (srv_has_codecs && srv_has_surfcmds && srv_has_multifrag) {
+        std::vector<uint8_t> c;
+        push_u8(c, 1);  // bitmapCodecCount = 1 (NSCodec)
+        // CODEC_GUID_NSCODEC = {0xCA8D1BB9, 0x000F, 0x154F, {0x58,0x9F,0xAE,0x2D,0x1A,0x87,0xE2,0xD6}}
+        static constexpr uint8_t nsc_guid[16] = {
+            0xB9, 0x1B, 0x8D, 0xCA, 0x0F, 0x00, 0x4F, 0x15,
+            0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6
+        };
+        c.insert(c.end(), nsc_guid, nsc_guid + 16);
+        push_u8(c, 1);       // codecID = 1 (NSCodec)
+        push_le16(c, 3);     // codecPropertiesLength = 3
+        push_u8(c, 1);       // fAllowDynamicFidelity = TRUE
+        push_u8(c, 1);       // fAllowSubsampling = TRUE (4:2:0 chroma subsampling)
+        push_u8(c, 3);       // colorLossLevel = 3 (FreeRDP default: crisp + very fast)
+        add_cap(0x001D, c);
+    }
+    // 21. CAPSETTYPE_FRAME_ACKNOWLEDGE (0x001E) - sliding window flow control for Surface frames
+    if (srv_has_frame_ack) {
+        std::vector<uint8_t> c;
+        push_le32(c, 2);  // maxUnacknowledgedFrameCount = 2
+        add_cap(0x001E, c);
+    }
 
     const char* src_desc = "MSTSC";
     uint16_t src_len = static_cast<uint16_t>(std::strlen(src_desc) + 1);
@@ -1387,12 +1617,64 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
 
 void RdpBackend::mark_dirty(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
+    if (in_surface_frame_) {
+        // Inside SurfaceFrameMarker Begin..End: stage dirty rects until End so the user NEVER sees scanline tearing!
+        if (pending_frame_rects_.size() > 128) {
+            pending_full_dirty_ = true;
+            pending_frame_rects_.clear();
+        } else if (!pending_full_dirty_) {
+            pending_frame_rects_.push_back({x, y, w, h});
+        }
+        return;
+    }
     if (dirty_rects_.size() > 64) {
         full_dirty_ = true;
         dirty_rects_.clear();
     } else if (!full_dirty_) {
         dirty_rects_.push_back({x, y, w, h});
     }
+}
+
+void RdpBackend::send_frame_ack(uint32_t frame_id) {
+    if (!srv_frame_ack_) return;
+    uint8_t body[4];
+    body[0] = uint8_t(frame_id & 0xFF);
+    body[1] = uint8_t((frame_id >> 8) & 0xFF);
+    body[2] = uint8_t((frame_id >> 16) & 0xFF);
+    body[3] = uint8_t((frame_id >> 24) & 0xFF);
+    send_share_data(0x38, body, 4);  // DATA_PDU_TYPE_FRAME_ACKNOWLEDGE (0x38)
+}
+
+void RdpBackend::blit_nscodec_rect(int left, int top, int width, int height,
+                                   const uint8_t* data, size_t len, int draw_w, int draw_h) {
+    if (width <= 0 || height <= 0 || !data || len < 20) return;
+    if (draw_w <= 0 || draw_w > width) draw_w = width;
+    if (draw_h <= 0 || draw_h > height) draw_h = height;
+
+    thread_local std::vector<uint32_t> pixels;
+    if (!decompress_nscodec(data, len, width, height, pixels)) {
+        if (!bad_codec_logged_) {
+            bad_codec_logged_ = true;
+            platform::log_line("[RDP] NSCodec decode failed w=" + std::to_string(width) + " h=" + std::to_string(height));
+        }
+        return;
+    }
+
+    // NSCodec surface bitmaps are stored bottom-up (FREERDP_FLIP_VERTICAL)
+    std::lock_guard<std::mutex> lk(fb_mu_);
+    for (int y = 0; y < height; ++y) {
+        int row_from_top = height - 1 - y;
+        if (row_from_top >= draw_h) continue;
+        int dst_y = top + row_from_top;
+        if (dst_y < 0 || dst_y >= fb_h_) continue;
+        int copy_w = std::min(draw_w, fb_w_ - left);
+        if (copy_w > 0 && left >= 0) {
+            std::memcpy(fb_rgba_.data() + static_cast<size_t>(dst_y) * fb_w_ + left,
+                        pixels.data() + static_cast<size_t>(y) * width,
+                        static_cast<size_t>(copy_w) * 4);
+        }
+    }
+    mark_dirty(left, top, draw_w, draw_h);
 }
 
 void RdpBackend::blit_bitmap_rect(int left, int top, int width, int height, int bpp, bool compressed,
@@ -1576,23 +1858,84 @@ void RdpBackend::handle_surface_commands(const uint8_t* data, size_t len) {
     while (pos + 2 <= len) {
         uint16_t cmd = le16(data + pos);
         pos += 2;
-        if (cmd == 0x0001 || cmd == 0x0004) {  // SET_SURFACE_BITS / STREAM_SURFACE_BITS
+        if (cmd == 0x0001 || cmd == 0x0006) {
+            // CMDTYPE_SET_SURFACE_BITS (0x0001) or CMDTYPE_STREAM_SURFACE_BITS (0x0006)
             if (pos + 20 > len) break;
-            int left   = le16(data + pos + 0);
-            int top    = le16(data + pos + 2);
-            int bpp    = data[pos + 8];
-            uint16_t codec_id = data[pos + 11];
-            int w      = le16(data + pos + 12);
-            int h      = le16(data + pos + 14);
-            uint32_t blen = le32(data + pos + 16);
+            int left       = le16(data + pos + 0);
+            int top        = le16(data + pos + 2);
+            int right      = le16(data + pos + 4);
+            int bottom     = le16(data + pos + 6);
+            int bpp        = data[pos + 8];
+            uint8_t bflags = data[pos + 9];
+            uint8_t codec  = data[pos + 11];
+            int w          = le16(data + pos + 12);
+            int h          = le16(data + pos + 14);
+            uint32_t blen  = le32(data + pos + 16);
             pos += 20;
+            // Skip optional 24-byte TS_COMPRESSED_BITMAP_HEADER_EX when EX_COMPRESSED_BITMAP_HEADER_PRESENT (0x01) is set!
+            if (bflags & 0x01) {
+                if (pos + 24 > len) break;
+                pos += 24;
+            }
             if (pos + blen > len) break;
-            if (codec_id == 0) {
-                blit_bitmap_rect(left, top, w, h, bpp, false, data + pos, blen, w, h);
+
+            int draw_w = std::min(w, right - left);
+            int draw_h = std::min(h, bottom - top);
+            if (draw_w <= 0) draw_w = w;
+            if (draw_h <= 0) draw_h = h;
+
+            if (codec == 0) {
+                // Uncompressed raw surface bits (bottom-up BGRX)
+                blit_bitmap_rect(left, top, w, h, bpp, false, data + pos, blen, draw_w, draw_h);
+            } else if (codec == 1) {
+                // NSCodec (codecID = 1 advertised by us in CAPSETTYPE_BITMAP_CODECS)
+                blit_nscodec_rect(left, top, w, h, data + pos, blen, draw_w, draw_h);
+            } else {
+                if (!bad_codec_logged_) {
+                    bad_codec_logged_ = true;
+                    platform::log_line("[RDP] Unknown SurfaceBits codecID=" + std::to_string(codec));
+                }
             }
             pos += blen;
-        } else if (cmd == 0x0006) {  // FRAME_MARKER
-            pos += 6;
+        } else if (cmd == 0x0004) {
+            // CMDTYPE_FRAME_MARKER (0x0004): frameAction (u16) + frameId (u32)
+            if (pos + 2 > len) break;
+            uint16_t action = le16(data + pos);
+            pos += 2;
+            uint32_t frame_id = 0;
+            if (pos + 4 <= len) {
+                frame_id = le32(data + pos);
+                pos += 4;
+            }
+            if (action == 0x0000) {
+                // SURFACECMD_FRAMEACTION_BEGIN
+                std::lock_guard<std::mutex> lk(fb_mu_);
+                in_surface_frame_ = true;
+                pending_frame_rects_.clear();
+                pending_full_dirty_ = false;
+            } else if (action == 0x0001) {
+                // SURFACECMD_FRAMEACTION_END -> commit entire frame atomically & ACK frameId!
+                {
+                    std::lock_guard<std::mutex> lk(fb_mu_);
+                    in_surface_frame_ = false;
+                    if (pending_full_dirty_) {
+                        full_dirty_ = true;
+                        dirty_rects_.clear();
+                    } else {
+                        for (const auto& r : pending_frame_rects_) {
+                            if (dirty_rects_.size() > 128) {
+                                full_dirty_ = true;
+                                dirty_rects_.clear();
+                                break;
+                            }
+                            if (!full_dirty_) dirty_rects_.push_back(r);
+                        }
+                    }
+                    pending_frame_rects_.clear();
+                    pending_full_dirty_ = false;
+                }
+                send_frame_ack(frame_id);
+            }
         } else {
             break;
         }
@@ -1615,7 +1958,11 @@ bool RdpBackend::sync_texture(SDL_Renderer* renderer, SDL_Texture*& io_texture, 
     out_h = fb_h_;
     if (!io_texture) return false;
 
-    if (full_dirty_) {
+    // While a SurfaceFrameMarker Begin..End batch is mid-flight, hold the previous complete frame
+    // on screen so the user never sees progressive row/tile tearing!
+    if (in_surface_frame_ && !full_dirty_) return false;
+
+    if (full_dirty_ || dirty_rects_.size() > 8) {
         SDL_UpdateTexture(io_texture, nullptr, fb_rgba_.data(), fb_w_ * 4);
         full_dirty_ = false;
         dirty_rects_.clear();

@@ -61,6 +61,10 @@ private:
 
     z_stream zstream_{};
     bool zstream_ok_ = false;
+    std::vector<uint8_t> rx_cache_;
+    size_t rx_pos_ = 0;
+    size_t rx_len_ = 0;
+    bool in_fb_batch_ = false;
     std::atomic<uint64_t> rx_bytes_{0};
     std::atomic<bool> want_full_refresh_{false};
 

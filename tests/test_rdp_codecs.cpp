@@ -50,6 +50,36 @@ int main() {
         for (int y = 0; y < 16; ++y) for (int x = 0; x <= y * 2 / 3; ++x) a[y * w + x] = 1;
         if (cursor_detect::is_ibeam(a, w, h, 0, 0)) { ++fails; std::printf("arrow misdetected\n"); }
     }
+    // NSCodec 8x2 (4:2:0 subsampled + RLE): pure green R=0, G=200, B=0 -> Y=100, Co=0, Cg=100 (cll=1 -> shift=0)
+    {
+        // Y plane (8*2 = 16 bytes): RLE run of 12x 100 [100, 100, 10] + 4 raw [100,100,100,100] -> 7 bytes < 16
+        // Co plane (4*1 = 4 bytes): raw [0,0,0,0]
+        // Cg plane (4*1 = 4 bytes): raw [100,100,100,100]
+        // A plane: plane_bytes=0 (all 0xFF)
+        std::vector<uint8_t> nsc;
+        push_le32(nsc, 7);   // Y planeByteCount
+        push_le32(nsc, 4);   // Co planeByteCount
+        push_le32(nsc, 4);   // Cg planeByteCount
+        push_le32(nsc, 0);   // A planeByteCount
+        nsc.push_back(1);    // ColorLossLevel = 1 (shift=0)
+        nsc.push_back(1);    // ChromaSubsamplingLevel = 1 (4:2:0)
+        nsc.push_back(0); nsc.push_back(0);  // Reserved
+        // Y plane RLE (7 bytes -> 16 bytes of 100)
+        nsc.insert(nsc.end(), {100, 100, 10, 100, 100, 100, 100});
+        // Co plane raw (4 bytes of 0)
+        nsc.insert(nsc.end(), {0, 0, 0, 0});
+        // Cg plane raw (4 bytes of 100)
+        nsc.insert(nsc.end(), {100, 100, 100, 100});
+
+        std::vector<uint32_t> o;
+        if (!decompress_nscodec(nsc.data(), nsc.size(), 8, 2, o) || o.size() != 16) {
+            ++fails; std::printf("nscodec decode failed\n");
+        } else {
+            for (size_t i = 0; i < o.size(); ++i) {
+                if (o[i] != 0xFF00C800u) { ++fails; std::printf("nscodec px %zu = %08X\n", i, o[i]); break; }
+            }
+        }
+    }
     std::printf(fails ? "CODEC TESTS FAILED\n" : "ALL CODEC TESTS PASSED\n");
     return fails;
 }

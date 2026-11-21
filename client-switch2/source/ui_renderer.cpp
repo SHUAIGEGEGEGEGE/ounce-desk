@@ -68,6 +68,7 @@ void UIRenderer::shutdown() {
         font_atlas_ = nullptr;
     }
 #ifdef OUNCEDESK_HAS_TTF
+    clear_text_cache();
     if (ttf_small_) { TTF_CloseFont(ttf_small_); ttf_small_ = nullptr; }
     if (ttf_med_)   { TTF_CloseFont(ttf_med_);   ttf_med_ = nullptr; }
     if (ttf_large_) { TTF_CloseFont(ttf_large_); ttf_large_ = nullptr; }
@@ -75,6 +76,15 @@ void UIRenderer::shutdown() {
 #endif
     renderer_ = nullptr;
 }
+
+#ifdef OUNCEDESK_HAS_TTF
+void UIRenderer::clear_text_cache() {
+    for (auto& kv : text_cache_) {
+        if (kv.second.tex) SDL_DestroyTexture(kv.second.tex);
+    }
+    text_cache_.clear();
+}
+#endif
 
 void UIRenderer::build_bitmap_atlas() {
     constexpr int W = 96 * 8;
@@ -102,17 +112,33 @@ void UIRenderer::draw_text(int x, int y, const std::string& text, SDL_Color colo
     if (!renderer_ || text.empty()) return;
 
 #ifdef OUNCEDESK_HAS_TTF
-    TTF_Font* f = (scale >= 4) ? ttf_large_ : (scale >= 3 ? ttf_med_ : ttf_small_);
+    int bucket = (scale >= 4) ? 2 : (scale >= 3 ? 1 : 0);
+    TTF_Font* f = (bucket == 2) ? ttf_large_ : (bucket == 1 ? ttf_med_ : ttf_small_);
     if (f) {
-        SDL_Surface* surf = TTF_RenderUTF8_Blended(f, text.c_str(), color);
-        if (surf) {
-            SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer_, surf);
-            if (tex) {
-                SDL_Rect dst{x, y, surf->w, surf->h};
-                SDL_RenderCopy(renderer_, tex, nullptr, &dst);
-                SDL_DestroyTexture(tex);
+        if (text_cache_.size() > 512) clear_text_cache();
+        std::string key;
+        key.reserve(text.size() + 3);
+        key.push_back(static_cast<char>('0' + bucket));
+        key.push_back(':');
+        key.append(text);
+
+        auto it = text_cache_.find(key);
+        if (it == text_cache_.end()) {
+            SDL_Surface* surf = TTF_RenderUTF8_Blended(f, text.c_str(), SDL_Color{255, 255, 255, 255});
+            if (surf) {
+                SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer_, surf);
+                if (tex) {
+                    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+                    it = text_cache_.emplace(std::move(key), CachedText{tex, surf->w, surf->h}).first;
+                }
+                SDL_FreeSurface(surf);
             }
-            SDL_FreeSurface(surf);
+        }
+        if (it != text_cache_.end() && it->second.tex) {
+            SDL_SetTextureColorMod(it->second.tex, color.r, color.g, color.b);
+            SDL_SetTextureAlphaMod(it->second.tex, color.a);
+            SDL_Rect dst{x, y, it->second.w, it->second.h};
+            SDL_RenderCopy(renderer_, it->second.tex, nullptr, &dst);
             return;
         }
     }

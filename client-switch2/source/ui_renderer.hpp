@@ -5,6 +5,7 @@
 
 #include <SDL2/SDL.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef OUNCEDESK_HAS_TTF
@@ -116,6 +117,14 @@ private:
     TTF_Font* ttf_small_ = nullptr;
     TTF_Font* ttf_med_ = nullptr;
     TTF_Font* ttf_large_ = nullptr;
+
+    struct CachedText {
+        SDL_Texture* tex = nullptr;
+        int w = 0;
+        int h = 0;
+    };
+    std::unordered_map<std::string, CachedText> text_cache_;
+    void clear_text_cache();
 #endif
 
     void build_bitmap_atlas();

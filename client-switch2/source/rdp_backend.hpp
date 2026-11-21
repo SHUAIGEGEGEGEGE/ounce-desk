@@ -100,13 +100,23 @@ private:
     void handle_surface_commands(const uint8_t* data, size_t len);
     void blit_bitmap_rect(int left, int top, int width, int height, int bpp, bool compressed,
                           const uint8_t* data, size_t len, int draw_w, int draw_h);
+    void blit_nscodec_rect(int left, int top, int width, int height,
+                           const uint8_t* data, size_t len, int draw_w, int draw_h);
     void mark_dirty(int x, int y, int w, int h);
+    void send_frame_ack(uint32_t frame_id);
     void handle_pointer_attr(const uint8_t* data, size_t len, int xor_bpp, bool large);
     void handle_fastpath_update(uint8_t ucode, const uint8_t* data, size_t len, int& frames_win);
 
     bool bad_codec_logged_ = false;
     std::vector<uint8_t> fp_frag_buf_;   // Fast-Path fragment reassembly buffer
     uint8_t fp_frag_code_ = 0;
+    std::vector<uint8_t> rx_cache_;      // 64KB userland read-ahead buffer (eliminates 1-byte syscall overhead!)
+    size_t rx_pos_ = 0;
+    size_t rx_len_ = 0;
+    bool in_surface_frame_ = false;      // Batch dirty rects inside SurfaceFrameMarker Begin..End!
+    std::vector<DirtyRect> pending_frame_rects_;
+    bool pending_full_dirty_ = false;
+    bool srv_frame_ack_ = false;
     std::vector<uint8_t> ptr_cache_text_;  // pointer cache index -> is I-beam text cursor
     std::atomic<bool> cursor_text_{false};
     std::atomic<bool> cursor_known_{false};
