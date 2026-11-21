@@ -95,4 +95,7 @@ public:
     virtual bool cursor_is_text() const { return false; }
     // True once the server has sent at least one cursor-shape update (so cursor_is_text() is meaningful)
     virtual bool cursor_shape_known() const { return false; }
+    // Heuristic fallback when server bakes cursor/caret into framebuffer (e.g. macOS Screen Sharing):
+    // returns true if a vertical blinking text caret or text box exists near normalized (norm_x, norm_y).
+    virtual bool detect_text_focus_near(float /*norm_x*/, float /*norm_y*/) const { return false; }
 };

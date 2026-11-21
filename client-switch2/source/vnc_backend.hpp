@@ -32,8 +32,10 @@ public:
     void request_full_refresh() override;
     bool cursor_is_text() const override { return cursor_text_.load(); }
     bool cursor_shape_known() const override { return cursor_known_.load(); }
+    bool detect_text_focus_near(float norm_x, float norm_y) const override;
 
 private:
+    mutable std::mutex fb_mu_;
     std::atomic<bool> cursor_text_{false};
     std::atomic<bool> cursor_known_{false};
     ConnectionProfile profile_;
@@ -52,7 +54,6 @@ private:
     uint16_t last_x_ = 0;
     uint16_t last_y_ = 0;
 
-    std::mutex fb_mu_;
     int fb_w_ = 0;
     int fb_h_ = 0;
     std::vector<uint32_t> fb_rgba_;

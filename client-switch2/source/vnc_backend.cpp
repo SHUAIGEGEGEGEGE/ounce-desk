@@ -317,6 +317,14 @@ void VncBackend::request_full_refresh() {
     want_full_refresh_.store(true);
 }
 
+bool VncBackend::detect_text_focus_near(float norm_x, float norm_y) const {
+    std::lock_guard<std::mutex> lk(fb_mu_);
+    if (fb_w_ < 64 || fb_h_ < 64 || fb_rgba_.empty()) return false;
+    int cx = static_cast<int>(std::max(0.0f, std::min(1.0f, norm_x)) * (fb_w_ - 1));
+    int cy = static_cast<int>(std::max(0.0f, std::min(1.0f, norm_y)) * (fb_h_ - 1));
+    return cursor_detect::has_text_caret_or_box(fb_rgba_.data(), fb_w_, fb_h_, cx, cy);
+}
+
 bool VncBackend::decode_raw_rect(int rx, int ry, int rw, int rh) {
     std::vector<uint32_t> row_buf(static_cast<size_t>(rw));
     for (int y = 0; y < rh; ++y) {
@@ -703,15 +711,16 @@ void VncBackend::run_session() {
     spf[16] = 16; // blue-shift
     if (!send_all(spf, sizeof(spf))) { set_error("SetPixelFormat failed"); return; }
 
-    // 6. SetEncodings: ZRLE (16), CopyRect (1), Raw (0), DesktopSize (-223), Cursor (-239)
-    uint8_t encs[4 + 5 * 4]{};
+    // 6. SetEncodings: ZRLE (16), CopyRect (1), Raw (0), DesktopSize (-223), CursorWithAlpha (-314), Cursor (-239)
+    uint8_t encs[4 + 6 * 4]{};
     encs[0] = 2;  // SetEncodings
-    put_be16(encs + 2, 5);
+    put_be16(encs + 2, 6);
     put_be32(encs + 4, 16);                              // ZRLE
     put_be32(encs + 8, 1);                               // CopyRect
     put_be32(encs + 12, 0);                              // Raw
     put_be32(encs + 16, static_cast<uint32_t>(-223));    // DesktopSize
-    put_be32(encs + 20, static_cast<uint32_t>(-239));    // Cursor pseudo-encoding (detect I-beam text cursor)
+    put_be32(encs + 20, static_cast<uint32_t>(-314));    // CursorWithAlpha (macOS native alpha cursor)
+    put_be32(encs + 24, static_cast<uint32_t>(-239));    // RichCursor / Cursor pseudo-encoding
     if (!send_all(encs, sizeof(encs))) { set_error("SetEncodings failed"); return; }
 
     state_.store(BackendState::STREAMING);
@@ -765,6 +774,33 @@ void VncBackend::run_session() {
                     std::lock_guard<std::mutex> ik(info_mu_);
                     stats_.fb_width = fb_w_;
                     stats_.fb_height = fb_h_;
+                } else if (enc == -314) {
+                    // CursorWithAlpha (-314): 4-byte sub-encoding + encoded w*h*4 RGBA pixels
+                    uint8_t sub_b[4];
+                    if (!recv_all(sub_b, 4)) { stop_.store(true); break; }
+                    int32_t sub_enc = sbe32(sub_b);
+                    std::vector<uint8_t> rgba(static_cast<size_t>(rw) * rh * 4, 0);
+                    bool ok_cur = true;
+                    if (sub_enc == 0 && !rgba.empty()) {
+                        ok_cur = recv_all(rgba.data(), rgba.size());
+                    } else if (sub_enc == 16 && rw > 0 && rh > 0) {
+                        // ZRLE-compressed alpha cursor (4-byte length + zlib stream)
+                        uint8_t lb[4];
+                        if (!recv_all(lb, 4)) { stop_.store(true); break; }
+                        uint32_t zl = be32(lb);
+                        std::vector<uint8_t> skip(zl);
+                        if (zl > 0 && !recv_all(skip.data(), zl)) { stop_.store(true); break; }
+                        ok_cur = false;
+                    }
+                    if (!ok_cur && sub_enc == 0) { stop_.store(true); break; }
+                    if (ok_cur && rw > 0 && rh > 0) {
+                        std::vector<uint8_t> vis(static_cast<size_t>(rw) * rh, 0);
+                        for (int i = 0; i < rw * rh; ++i) {
+                            vis[static_cast<size_t>(i)] = (rgba[static_cast<size_t>(i) * 4 + 3] >= 48) ? 1 : 0;
+                        }
+                        cursor_known_.store(true);
+                        cursor_text_.store(cursor_detect::is_ibeam(vis, rw, rh, rx, ry));
+                    }
                 } else if (enc == -239) {
                     // Cursor pseudo-encoding: rx/ry = hotspot, w*h pixels (4 bytes each) + 1bpp mask
                     size_t pix_len = static_cast<size_t>(rw) * rh * 4;

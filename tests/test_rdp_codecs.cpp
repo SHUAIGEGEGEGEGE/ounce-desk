@@ -50,6 +50,23 @@ int main() {
         for (int y = 0; y < 16; ++y) for (int x = 0; x <= y * 2 / 3; ++x) a[y * w + x] = 1;
         if (cursor_detect::is_ibeam(a, w, h, 0, 0)) { ++fails; std::printf("arrow misdetected\n"); }
     }
+    // macOS framebuffer text-caret / input-box detector vs blank desktop
+    {
+        int fw = 320, fh = 200;
+        std::vector<uint32_t> blank(fw * fh, 0xFF302820u);
+        if (cursor_detect::has_text_caret_or_box(blank.data(), fw, fh, 160, 100)) {
+            ++fails; std::printf("blank desktop misdetected as text box\n");
+        }
+        // Draw a white text input box (x=60..260, y=86..114) with a 1px dark vertical caret at x=120
+        std::vector<uint32_t> box = blank;
+        for (int y = 86; y <= 114; ++y)
+            for (int x = 60; x <= 260; ++x)
+                box[y * fw + x] = 0xFFFFFFFFu;
+        for (int y = 90; y <= 110; ++y) box[y * fw + 120] = 0xFF000000u;
+        if (!cursor_detect::has_text_caret_or_box(box.data(), fw, fh, 150, 100)) {
+            ++fails; std::printf("macOS text input box / caret not detected\n");
+        }
+    }
     // NSCodec 8x2 (4:2:0 subsampled + RLE): pure green R=0, G=200, B=0 -> Y=100, Co=0, Cg=100 (cll=1 -> shift=0)
     {
         // Y plane (8*2 = 16 bytes): RLE run of 12x 100 [100, 100, 10] + 4 raw [100,100,100,100] -> 7 bytes < 16

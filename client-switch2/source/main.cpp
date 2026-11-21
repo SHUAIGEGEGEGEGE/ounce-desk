@@ -161,9 +161,6 @@ int main(int argc, char* argv[]) {
     reload_wg_configs();
 
     bool slider_dragging = false;
-    SDL_Rect kbd_bubble{0, 0, 0, 0};
-    uint64_t kbd_bubble_until_us = 0;
-    int bubble_x = 0, bubble_y = 0;
 
     // Persistent settings: sdmc:/switch/OunceDesk/settings.txt
     const std::string settings_path = platform::get_config_dir() + "/settings.txt";
@@ -220,6 +217,13 @@ int main(int argc, char* argv[]) {
 
     bool running = true;
 
+    auto form_field_count = [&]() -> int {
+        return (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+    };
+    auto form_total_items = [&]() -> int {
+        return form_field_count() + 3;
+    };
+
     auto open_new_form = [&](ProtocolType proto) {
         draft = {};
         draft.protocol = proto;
@@ -227,19 +231,24 @@ int main(int argc, char* argv[]) {
         draft.host = "";
         draft.req_width = 1920;
         draft.req_height = 1080;
-        form_focus = 1;
+        form_focus = 2;  // Focus Server Address by default (Name at index 1 is optional)
         form_error.clear();
         show_home_menu = false;
         mode = AppMode::FORM;
     };
 
-    auto start_connection = [&](const ConnectionProfile& p) {
+    auto start_connection = [&](const ConnectionProfile& p, bool also_save) {
         if (p.host.empty()) {
-            form_error = "请输入电脑 IP / IPv6 地址或 DDNS 域名";
+            form_error = "请输入服务器地址";
             return;
         }
         active_profile = p;
-        profiles.add_or_update(active_profile, profiles_path);
+        if (active_profile.name.empty()) {
+            active_profile.name = active_profile.host;
+        }
+        if (also_save) {
+            profiles.add_or_update(active_profile, profiles_path);
+        }
         if (backend) {
             backend->disconnect();
             backend.reset();
@@ -269,48 +278,54 @@ int main(int argc, char* argv[]) {
             draft.port = (draft.protocol == ProtocolType::VNC_MACOS) ? 5900 : 3389;
         } else if (field_idx == 1) {
             std::string v;
-            if (platform::show_system_keyboard("输入 IP / IPv6 / DDNS 域名 (可加 :端口，如 myhome.ddns.net:3390)", draft.host, v, false, false)) {
-                draft.host = v;
+            if (platform::show_system_keyboard("请输入服务器名称 (选填)", draft.name, v, false, false)) {
+                draft.name = v;
             }
         } else if (field_idx == 2) {
+            std::string v;
+            if (platform::show_system_keyboard("请输入服务器地址 (IP 或域名)", draft.host, v, false, false)) {
+                draft.host = v;
+            }
+        } else if (field_idx == 3) {
             std::string v;
             if (platform::show_system_keyboard("请输入端口号 (Windows 3389 / Mac 5900)", std::to_string(draft.port), v, true, false)) {
                 int p = std::atoi(v.c_str());
                 if (p > 0 && p <= 65535) draft.port = static_cast<uint16_t>(p);
             }
-        } else if (field_idx == 3) {
+        } else if (field_idx == 4) {
             std::string v;
             std::string hdr = (draft.protocol == ProtocolType::VNC_MACOS)
-                                  ? "请输入 macOS 用户名 (若仅用 VNC 密码可留空)"
-                                  : "请输入 Windows 登录用户名";
+                                  ? "请输入用户名 (若仅用 VNC 密码可留空)"
+                                  : "请输入用户名";
             if (platform::show_system_keyboard(hdr, draft.username, v, false, false)) {
                 draft.username = v;
             }
-        } else if (field_idx == 4) {
+        } else if (field_idx == 5) {
             std::string v;
             if (platform::show_system_keyboard("请输入登录密码", draft.password, v, false, true)) {
                 draft.password = v;
             }
-        } else if (field_idx == 5) {
-            if (draft.protocol == ProtocolType::VNC_MACOS) {
-                std::string v;
-                if (platform::show_system_keyboard("请输入设备备注名称", draft.name, v, false, false)) draft.name = v;
-            } else {
-                if (draft.req_width == 1920) { draft.req_width = 1280; draft.req_height = 720; }
-                else { draft.req_width = 1920; draft.req_height = 1080; }
-            }
+        } else if (field_idx == 6 && draft.protocol == ProtocolType::RDP_WINDOWS) {
+            if (draft.req_width == 1920) { draft.req_width = 1280; draft.req_height = 720; }
+            else { draft.req_width = 1920; draft.req_height = 1080; }
         }
     };
+
+    uint64_t last_us = platform::now_us();
 
     auto open_streaming_swkbd = [&]() {
         if (!backend) return;
         std::string typed;
-        if (platform::show_system_keyboard("请输入要发送到远程电脑的文字", "", typed, false, false)) {
+        if (platform::show_system_keyboard("请输入文字", "", typed, false, false)) {
             if (!typed.empty()) backend->send_text_utf8(typed);
-        } else {
-            // Desktop fallback when native swkbd does not exist
+        } else if (!platform::is_switch_hardware()) {
+            // Only fall back to built-in OSK on Desktop PCs that have no system keyboard applet!
+            // On Switch 2, pressing B / Cancel simply closes the native keyboard cleanly.
             show_osk = true;
         }
+        prev_native_touches.clear();
+        touch_block = true;
+        last_us = platform::now_us();
     };
 
     auto handle_home_menu_action = [&](const std::string& id) {
@@ -403,8 +418,6 @@ int main(int argc, char* argv[]) {
         if (osk_sticky_mods & RD_MOD_LCTRL)  backend->send_key(224, false, 0);
         osk_sticky_mods = 0;
     };
-
-    uint64_t last_us = platform::now_us();
 
     while (running) {
         uint64_t now = platform::now_us();
@@ -503,7 +516,8 @@ int main(int argc, char* argv[]) {
                         size_t idx = static_cast<size_t>(std::atoi(btn.id.c_str() + 4));
                         if (idx < win_profs.size()) {
                             draft = win_profs[idx];
-                            form_focus = draft.username.empty() ? 3 : (draft.password.empty() ? 4 : 8);
+                            int nf = (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+                            form_focus = draft.username.empty() ? 4 : (draft.password.empty() ? 5 : (nf + 2));
                             form_error.clear();
                             mode = AppMode::FORM;
                         }
@@ -511,7 +525,8 @@ int main(int argc, char* argv[]) {
                         size_t idx = static_cast<size_t>(std::atoi(btn.id.c_str() + 4));
                         if (idx < mac_profs.size()) {
                             draft = mac_profs[idx];
-                            form_focus = draft.username.empty() ? 3 : (draft.password.empty() ? 4 : 8);
+                            int nf = (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+                            form_focus = draft.username.empty() ? 4 : (draft.password.empty() ? 5 : (nf + 2));
                             form_error.clear();
                             mode = AppMode::FORM;
                         }
@@ -522,14 +537,23 @@ int main(int argc, char* argv[]) {
                 for (const auto& btn : active_buttons) {
                     if (!UIRenderer::hit_test(btn.rect, tap_x, tap_y)) continue;
                     if (btn.id == "f:proto") { form_focus = 0; edit_form_field(0); }
-                    else if (btn.id == "f:host") { form_focus = 1; edit_form_field(1); }
-                    else if (btn.id == "f:port") { form_focus = 2; edit_form_field(2); }
-                    else if (btn.id == "f:user") { form_focus = 3; edit_form_field(3); }
-                    else if (btn.id == "f:pass") { form_focus = 4; edit_form_field(4); }
-                    else if (btn.id == "f:res")  { form_focus = 5; edit_form_field(5); }
+                    else if (btn.id == "f:name") { form_focus = 1; edit_form_field(1); }
+                    else if (btn.id == "f:host") { form_focus = 2; edit_form_field(2); }
+                    else if (btn.id == "f:port") { form_focus = 3; edit_form_field(3); }
+                    else if (btn.id == "f:user") { form_focus = 4; edit_form_field(4); }
+                    else if (btn.id == "f:pass") { form_focus = 5; edit_form_field(5); }
+                    else if (btn.id == "f:res")  { form_focus = 6; edit_form_field(6); }
                     else if (btn.id == "form_cancel") mode = AppMode::BROWSER;
-                    else if (btn.id == "form_save") { profiles.add_or_update(draft, profiles_path); mode = AppMode::BROWSER; }
-                    else if (btn.id == "form_connect") start_connection(draft);
+                    else if (btn.id == "form_save") {
+                        if (draft.host.empty()) {
+                            form_error = "请输入服务器地址";
+                        } else {
+                            profiles.add_or_update(draft, profiles_path);
+                            status_banner = "已保存配置: " + (draft.name.empty() ? draft.host : draft.name);
+                            mode = AppMode::BROWSER;
+                        }
+                    }
+                    else if (btn.id == "form_connect") start_connection(draft, false);
                     break;
                 }
             } else if (mode == AppMode::STREAMING && backend) {
@@ -566,17 +590,6 @@ int main(int argc, char* argv[]) {
                     int tx = static_cast<int>(kv.second.x);
                     int ty = static_cast<int>(kv.second.y);
                     if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
-                        // Floating "open keyboard" bubble (macOS fallback): tap it -> Switch 2 keyboard; tap anywhere else -> dismiss
-                        if (kbd_bubble_until_us != 0) {
-                            bool hit_bubble = UIRenderer::hit_test(kbd_bubble, tx, ty);
-                            kbd_bubble_until_us = 0;
-                            if (hit_bubble) {
-                                tap_tracking = false;
-                                open_streaming_swkbd();
-                                touch_block = true;  // ignore touches until all fingers are lifted
-                                break;
-                            }
-                        }
                         if (cur_map.size() == 1 && prev_native_touches.empty()) {
                             tap_tracking = true;
                             tap_down_us = now;
@@ -725,7 +738,8 @@ int main(int argc, char* argv[]) {
                         profiles.remove_saved(cur_list[selected_row], profiles_path);
                     } else if (b == SDL_CONTROLLER_BUTTON_A && !cur_list.empty()) {
                         draft = cur_list[selected_row];
-                        form_focus = draft.username.empty() ? 3 : (draft.password.empty() ? 4 : 8);
+                        int nf = (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+                        form_focus = draft.username.empty() ? 4 : (draft.password.empty() ? 5 : (nf + 2));
                         form_error.clear();
                         mode = AppMode::FORM;
                     }
@@ -737,35 +751,46 @@ int main(int argc, char* argv[]) {
                     dispatch_ui_tap(dtap_x, dtap_y);
                 }
             } else if (mode == AppMode::FORM) {
+                const int nf = form_field_count();
+                const int total_items = form_total_items();
+                if (form_focus >= total_items) form_focus = total_items - 1;
                 if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
                     auto b = ev.cbutton.button;
                     if (b == SDL_CONTROLLER_BUTTON_B) mode = AppMode::BROWSER;
-                    else if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) form_focus = (form_focus + 1) % 9;
-                    else if (b == SDL_CONTROLLER_BUTTON_DPAD_UP)   form_focus = (form_focus + 8) % 9;
+                    else if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) form_focus = (form_focus + 1) % total_items;
+                    else if (b == SDL_CONTROLLER_BUTTON_DPAD_UP)   form_focus = (form_focus + total_items - 1) % total_items;
                     else if (b == SDL_CONTROLLER_BUTTON_A) {
-                        if (form_focus < 6) edit_form_field(form_focus);
-                        else if (form_focus == 6) mode = AppMode::BROWSER;
-                        else if (form_focus == 7) { profiles.add_or_update(draft, profiles_path); mode = AppMode::BROWSER; }
-                        else if (form_focus == 8) start_connection(draft);
+                        if (form_focus < nf) edit_form_field(form_focus);
+                        else if (form_focus == nf + 0) mode = AppMode::BROWSER;
+                        else if (form_focus == nf + 1) {
+                            if (draft.host.empty()) {
+                                form_error = "请输入服务器地址";
+                            } else {
+                                profiles.add_or_update(draft, profiles_path);
+                                status_banner = "已保存配置: " + (draft.name.empty() ? draft.host : draft.name);
+                                mode = AppMode::BROWSER;
+                            }
+                        }
+                        else if (form_focus == nf + 2) start_connection(draft, false);
                     }
                 } else if (ev.type == SDL_KEYDOWN) {
                     SDL_Keycode sym = ev.key.keysym.sym;
                     if (sym == SDLK_ESCAPE) mode = AppMode::BROWSER;
-                    else if (sym == SDLK_TAB) form_focus = (form_focus + 1) % 9;
+                    else if (sym == SDLK_TAB) form_focus = (form_focus + 1) % total_items;
                     else if (sym == SDLK_RETURN) {
-                        if (form_focus == 0) edit_form_field(0);
-                        else start_connection(draft);
+                        if (form_focus == 0 || (form_focus == 6 && draft.protocol == ProtocolType::RDP_WINDOWS)) edit_form_field(form_focus);
+                        else start_connection(draft, false);
                     } else if (sym == SDLK_BACKSPACE) {
-                        if (form_focus == 1 && !draft.host.empty()) draft.host.pop_back();
-                        else if (form_focus == 3 && !draft.username.empty()) draft.username.pop_back();
-                        else if (form_focus == 4 && !draft.password.empty()) draft.password.pop_back();
-                        else if (form_focus == 5 && draft.protocol == ProtocolType::VNC_MACOS && !draft.name.empty()) draft.name.pop_back();
+                        if (form_focus == 1 && !draft.name.empty()) draft.name.pop_back();
+                        else if (form_focus == 2 && !draft.host.empty()) draft.host.pop_back();
+                        else if (form_focus == 4 && !draft.username.empty()) draft.username.pop_back();
+                        else if (form_focus == 5 && !draft.password.empty()) draft.password.pop_back();
                     }
                 } else if (ev.type == SDL_TEXTINPUT) {
-                    if (form_focus == 1) draft.host += ev.text.text;
-                    else if (form_focus == 3) draft.username += ev.text.text;
-                    else if (form_focus == 4) draft.password += ev.text.text;
-                    else if (form_focus == 5 && draft.protocol == ProtocolType::VNC_MACOS) draft.name += ev.text.text;
+                    if (form_focus == 1) draft.name += ev.text.text;
+                    else if (form_focus == 2) draft.host += ev.text.text;
+                    else if (form_focus == 4) draft.username += ev.text.text;
+                    else if (form_focus == 5) draft.password += ev.text.text;
                 } else if (desktop_tap) {
                     dispatch_ui_tap(dtap_x, dtap_y);
                 }
@@ -825,11 +850,6 @@ int main(int argc, char* argv[]) {
                         overlay_focus = 0;
                         continue;
                     }
-                    if (desktop_tap && kbd_bubble_until_us != 0) {
-                        bool hit_b = UIRenderer::hit_test(kbd_bubble, dtap_x, dtap_y);
-                        kbd_bubble_until_us = 0;
-                        if (hit_b) { open_streaming_swkbd(); continue; }
-                    }
                     bool open_swkbd = false;
                     if (input.handle_sdl_event(ev, *backend, LOGICAL_W, LOGICAL_H, open_swkbd)) {
                         show_overlay = true;
@@ -856,38 +876,27 @@ int main(int argc, char* argv[]) {
             input.update_frame(dt, pad, *backend);
         }
 
-        // Auto-open Switch 2 native keyboard when the tap landed on a remote text input (I-beam cursor)
+        // Auto-open Switch 2 native keyboard when the tap landed on a remote text input (I-beam cursor or macOS text caret/box)
         if (ime_check_at_us != 0 && platform::now_us() >= ime_check_at_us) {
             ime_check_at_us = 0;
             if (auto_ime && mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
-                if (backend->cursor_is_text()) {
-                    platform::log_line("[UI] Tap on remote text field -> opening Switch 2 keyboard");
-                    std::string typed;
-                    if (platform::show_system_keyboard("请输入文字 (点取消/空白处返回)", "", typed, false, false)) {
-                        if (!typed.empty()) backend->send_text_utf8(typed);
+                bool is_text_target = backend->cursor_is_text();
+                if (!is_text_target && (backend->protocol() == ProtocolType::VNC_MACOS || !backend->cursor_shape_known())) {
+                    // Compute normalized remote coordinates of the tap / cursor and inspect framebuffer for caret or input box
+                    const auto& vp = input.viewport();
+                    float nx = vp.cursor_x;
+                    float ny = vp.cursor_y;
+                    if (input.touch_mode() == TouchMode::TOUCH && vp.dst_rect.w > 0 && vp.dst_rect.h > 0) {
+                        nx = (last_tap_x - static_cast<float>(vp.dst_rect.x)) / static_cast<float>(vp.dst_rect.w);
+                        ny = (last_tap_y - static_cast<float>(vp.dst_rect.y)) / static_cast<float>(vp.dst_rect.h);
                     }
-                    prev_native_touches.clear();
-                    touch_block = true;
-                    last_us = platform::now_us();
-                } else if (backend->protocol() == ProtocolType::VNC_MACOS || !backend->cursor_shape_known()) {
-                    // macOS Screen Sharing often does not report the I-beam cursor shape -> show a small
-                    // floating "keyboard" bubble next to the tap. Tap it = Switch 2 keyboard; tap elsewhere = dismiss.
-                    float px = last_tap_x, py = last_tap_y;
-                    if (input.touch_mode() == TouchMode::MOUSE) {
-                        const auto& vp = input.viewport();
-                        px = vp.dst_rect.x + vp.cursor_x * vp.dst_rect.w;
-                        py = vp.dst_rect.y + vp.cursor_y * vp.dst_rect.h;
-                    }
-                    bubble_x = std::max(10, std::min(LOGICAL_W - 260, static_cast<int>(px) + 24));
-                    bubble_y = static_cast<int>(py) - 100;
-                    if (bubble_y < 70) bubble_y = static_cast<int>(py) + 50;
-                    bubble_y = std::max(10, std::min(LOGICAL_H - 74, bubble_y));
-                    kbd_bubble_until_us = platform::now_us() + 3000000ULL;
+                    is_text_target = backend->detect_text_focus_near(nx, ny);
+                }
+                if (is_text_target) {
+                    platform::log_line("[UI] Tap on remote text field -> opening native keyboard directly");
+                    open_streaming_swkbd();
                 }
             }
-        }
-        if (kbd_bubble_until_us != 0 && (platform::now_us() > kbd_bubble_until_us || mode != AppMode::STREAMING || show_overlay)) {
-            kbd_bubble_until_us = 0;
         }
 
         // Render frame in exact 1920x1080 logical space
@@ -937,9 +946,6 @@ int main(int argc, char* argv[]) {
                 ui.render_cursor(input.viewport());
             }
             menu_pill = ui.render_menu_pill(LOGICAL_W, LOGICAL_H);
-            if (kbd_bubble_until_us != 0 && !show_overlay && !show_osk) {
-                kbd_bubble = ui.render_kbd_bubble(bubble_x, bubble_y);
-            }
             auto st = backend->stats();
             if (show_hud) ui.render_perf_hud(LOGICAL_W, LOGICAL_H, st, input.touch_mode(), input.viewport().zoom);
             if (show_overlay) {

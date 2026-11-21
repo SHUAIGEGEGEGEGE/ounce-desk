@@ -76,9 +76,6 @@ public:
     void render_sens_slider(int x, int y, int w, float sensitivity, std::vector<UIButton>& out);
     static float sens_from_track_x(const SDL_Rect& track, int x);
 
-    // Floating 'open keyboard' bubble shown after tapping (macOS fallback); returns its rect
-    SDL_Rect render_kbd_bubble(int x, int y);
-
     // 3. Add / Edit / Login Connection Form Modal (Touch + Switch 2 Native Keyboard)
     std::vector<UIButton> render_connect_form(
         int win_w, int win_h,

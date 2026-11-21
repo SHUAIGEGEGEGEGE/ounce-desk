@@ -361,11 +361,11 @@ std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMo
                                                    : "控制模式: 鼠标指针 (点击切换为触屏模式)",
                        true, false, false});
     y += bh + gap;
-    buttons.push_back({{bx, y, bw, bh}, "hm:scan", "重新扫描局域网 (Windows 3389 / macOS 5900)", false, false, false});
+    buttons.push_back({{bx, y, bw, bh}, "hm:scan", "重新扫描局域网", false, false, false});
     y += bh + gap;
-    buttons.push_back({{bx, y, bw, bh}, "hm:add_rdp", "添加 Windows 远程桌面 (IP / IPv6 / DDNS 域名)", false, false, false});
+    buttons.push_back({{bx, y, bw, bh}, "hm:add_rdp", "添加 Windows 远程桌面", false, false, false});
     y += bh + gap;
-    buttons.push_back({{bx, y, bw, bh}, "hm:add_mac", "添加 苹果 macOS 屏幕共享 (IP / IPv6 / DDNS 域名)", false, false, false});
+    buttons.push_back({{bx, y, bw, bh}, "hm:add_mac", "添加苹果 macOS 屏幕共享", false, false, false});
     y += bh + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:manage", "管理 / 删除已添加的设备", false, false, false});
     y += bh + gap;
@@ -411,7 +411,7 @@ std::vector<UIButton> UIRenderer::render_wg_manager(
     SDL_Rect panel{(win_w - pw) / 2, (win_h - ph) / 2, pw, ph};
     draw_panel(panel, COL_PANEL, COL_ACCENT);
 
-    draw_text(panel.x + 36, panel.y + 22, "WireGuard 安全隧道 (应用内用户态 · 零变砖风险)", COL_ACCENT, 3);
+    draw_text(panel.x + 36, panel.y + 22, "WireGuard 加密隧道", COL_ACCENT, 3);
     draw_text(panel.x + 36, panel.y + 66,
               "将路由器导出的 .conf 放入 /switch/OunceDesk/wg/ 目录即可一键连回家中内网",
               COL_MUTED, 2);
@@ -535,13 +535,6 @@ std::vector<UIButton> UIRenderer::render_device_manager(int win_w, int win_h, co
     return buttons;
 }
 
-SDL_Rect UIRenderer::render_kbd_bubble(int x, int y) {
-    SDL_Rect r{x, y, 250, 64};
-    draw_panel(r, {14, 116, 144, 240}, COL_ACCENT);
-    draw_text(r.x + 22, r.y + 18, "[键盘] 点此输入文字", COL_TEXT, 2);
-    return r;
-}
-
 std::vector<UIButton> UIRenderer::render_connect_form(
     int win_w, int win_h,
     const ConnectionProfile& draft,
@@ -554,54 +547,55 @@ std::vector<UIButton> UIRenderer::render_connect_form(
     SDL_Rect full{0, 0, win_w, win_h};
     SDL_RenderFillRect(renderer_, &full);
 
+    bool is_mac = (draft.protocol == ProtocolType::VNC_MACOS);
     int mw = 960;
-    int mh = 780;
+    int mh = is_mac ? 800 : 880;
     SDL_Rect modal{(win_w - mw) / 2, (win_h - mh) / 2, mw, mh};
     draw_panel(modal, COL_PANEL, COL_ACCENT);
 
-    bool is_mac = (draft.protocol == ProtocolType::VNC_MACOS);
     draw_text(modal.x + 36, modal.y + 22,
               is_mac ? "连接苹果 macOS 屏幕共享 (端口 5900)" : "连接 Windows 远程桌面 (端口 3389)",
               is_mac ? COL_MAC : COL_WIN, 3);
-    draw_text(modal.x + 36, modal.y + 64,
-              "直接触屏点击任意输入框或按 [A] 即可调用 Switch 2 系统原生输入法",
+    draw_text(modal.x + 36, modal.y + 62,
+              "点击任意选项或按 [A] 进行填写",
               COL_MUTED, 2);
 
     struct Row { const char* id; const char* title; std::string val; };
     std::vector<Row> rows = {
-        {"f:proto", "系统协议类型 (点击切换)", is_mac ? "苹果 macOS 屏幕共享 / VNC (端口 5900)" : "Windows 远程桌面 / RDP (端口 3389)"},
-        {"f:host",  "电脑地址: IPv4 / IPv6 / DDNS 域名 [系统原生键盘]", draft.host.empty() ? "(例如 192.168.33.186 / 2408:8000::1 / myhome.ddns.net)" : draft.host},
-        {"f:port",  "TCP 端口号 [数字键盘]",  std::to_string(draft.port)},
-        {"f:user",  is_mac ? "macOS 登录用户名 [系统原生键盘]" : "Windows 登录用户名 [系统原生键盘]",
-                    draft.username.empty() ? (is_mac ? "(输入 Mac 用户名；若仅用 VNC 密码可留空)" : "(点击输入 Windows 账户名)") : draft.username},
-        {"f:pass",  "登录密码 [系统原生键盘]", draft.password.empty() ? "(点击输入登录密码)" : std::string(draft.password.size(), '*')},
-        {"f:res",   is_mac ? "备注名称 [系统原生键盘]" : "远程桌面分辨率 (点击切换)",
-                    is_mac ? (draft.name.empty() ? "我的 Mac" : draft.name)
-                           : (std::to_string(draft.req_width) + "x" + std::to_string(draft.req_height))},
+        {"f:proto", "协议类型 (点击切换)", is_mac ? "苹果 macOS 屏幕共享 / VNC (端口 5900)" : "Windows 远程桌面 / RDP (端口 3389)"},
+        {"f:name",  "服务器名称 (选填)", draft.name.empty() ? "(选填，不填自动使用地址作为名称)" : draft.name},
+        {"f:host",  "服务器地址", draft.host.empty() ? "(请输入 IP 地址或域名，例如 192.168.33.186)" : draft.host},
+        {"f:port",  "端口号", std::to_string(draft.port)},
+        {"f:user",  "用户名", draft.username.empty() ? (is_mac ? "(输入 Mac 用户名；若仅用 VNC 密码可留空)" : "(点击输入登录用户名)") : draft.username},
+        {"f:pass",  "密码", draft.password.empty() ? "(点击输入登录密码)" : std::string(draft.password.size(), '*')},
     };
+    if (!is_mac) {
+        rows.push_back({"f:res", "桌面分辨率 (点击切换)", std::to_string(draft.req_width) + "x" + std::to_string(draft.req_height)});
+    }
 
-    int y = modal.y + 104;
+    int y = modal.y + 100;
     for (size_t i = 0; i < rows.size(); ++i) {
         bool foc = (static_cast<int>(i) == focused_field);
-        SDL_Rect r{modal.x + 36, y, mw - 72, 74};
+        SDL_Rect r{modal.x + 36, y, mw - 72, 70};
         draw_panel(r, foc ? SDL_Color{34, 48, 74, 255} : COL_BG, foc ? COL_ACCENT : COL_BORDER);
-        draw_text(r.x + 18, r.y + 10, rows[i].title, COL_MUTED, 2);
-        draw_text(r.x + 18, r.y + 38, rows[i].val, COL_TEXT, 2);
+        draw_text(r.x + 18, r.y + 9, rows[i].title, COL_MUTED, 2);
+        draw_text(r.x + 18, r.y + 37, rows[i].val, COL_TEXT, 2);
         buttons.push_back({r, rows[i].id, "", false, false, false});
-        y += 86;
+        y += 80;
     }
 
     if (!error_text.empty()) {
-        draw_text(modal.x + 36, y + 6, error_text, COL_DANGER, 2);
+        draw_text(modal.x + 36, y + 4, error_text, COL_DANGER, 2);
     }
 
-    int by = modal.y + mh - 88;
-    UIButton b_cancel{{modal.x + 36, by, 260, 62}, "form_cancel", "取消返回", false, false, true};
-    UIButton b_save  {{modal.x + 320, by, 280, 62}, "form_save", "仅保存配置", false, false, false};
-    UIButton b_go    {{modal.x + 624, by, 300, 62}, "form_connect", "保存并立即连接", true, false, false};
-    draw_button(b_cancel, focused_field == 6);
-    draw_button(b_save, focused_field == 7);
-    draw_button(b_go, focused_field == 8);
+    const int n_fields = static_cast<int>(rows.size());
+    int by = modal.y + mh - 86;
+    UIButton b_cancel{{modal.x + 36, by, 260, 62}, "form_cancel", "取消", false, false, true};
+    UIButton b_save  {{modal.x + 320, by, 280, 62}, "form_save", "保存配置", false, false, false};
+    UIButton b_go    {{modal.x + 624, by, 300, 62}, "form_connect", "连接", true, false, false};
+    draw_button(b_cancel, focused_field == n_fields + 0);
+    draw_button(b_save,   focused_field == n_fields + 1);
+    draw_button(b_go,     focused_field == n_fields + 2);
     buttons.push_back(b_cancel);
     buttons.push_back(b_save);
     buttons.push_back(b_go);
@@ -635,7 +629,7 @@ void UIRenderer::render_perf_hud(int win_w, int /*win_h*/, const BackendStats& s
     char line2[160];
     std::snprintf(line1, sizeof(line1), "%s | %dx%d | %.1f Mbps",
                   st.protocol_label.c_str(), st.fb_width, st.fb_height, st.rx_mbps);
-    std::snprintf(line2, sizeof(line2), "模式: %s | 缩放 %.1fx | [+] 菜单  [X] 原生输入法",
+    std::snprintf(line2, sizeof(line2), "模式: %s | 缩放 %.1fx | [+] 菜单  [X] 输入法",
                   (tmode == TouchMode::TOUCH) ? "触屏" : "鼠标", zoom);
 
     SDL_Rect box{win_w - 640, 14, 624, 62};
@@ -675,11 +669,11 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     buttons.push_back({q(0), "act:touch_mode",
                        (tmode == TouchMode::TOUCH) ? "当前: 触屏 -> 切为鼠标" : "当前: 鼠标 -> 切为触屏",
                        true, false, false});
-    buttons.push_back({q(1), "act:swkbd", "系统原生输入法", false, true, false});
+    buttons.push_back({q(1), "act:swkbd", "弹出输入法", false, true, false});
     buttons.push_back({q(2), "act:auto_ime",
                        auto_ime ? "点输入框自动弹键盘: 开" : "点输入框自动弹键盘: 关", false, auto_ime, false});
-    buttons.push_back({q(3), "act:osk", "电脑组合键键盘", false, false, false});
-    buttons.push_back({q(4), "act:refresh", "强制刷新画面", false, false, false});
+    buttons.push_back({q(3), "act:osk", "组合键键盘", false, false, false});
+    buttons.push_back({q(4), "act:refresh", "刷新画面", false, false, false});
 
     // Row 2: OS-Adaptive Shortcuts
     draw_text(panel.x + 32, panel.y + 178, is_mac ? "macOS 常用快捷键:" : "Windows 常用快捷键:", COL_MUTED, 2);
@@ -728,7 +722,7 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     }
 
     draw_text(panel.x + 32, panel.y + ph - 48,
-              "[+] 打开/关闭菜单  |  [X] 呼出 Switch 2 原生输入法  |  [-] 快速切换触屏/鼠标模式",
+              "[+] 打开/关闭菜单  |  [X] 呼出输入法  |  [-] 切换触屏/鼠标模式",
               COL_MUTED, 2);
     return buttons;
 }
