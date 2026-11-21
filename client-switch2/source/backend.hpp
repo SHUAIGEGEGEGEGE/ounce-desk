@@ -93,4 +93,6 @@ public:
     // True when the remote mouse cursor is currently an I-beam text cursor (hovering a text input field).
     // Used to auto-open the Switch 2 native keyboard when the user taps a remote text box.
     virtual bool cursor_is_text() const { return false; }
+    // True once the server has sent at least one cursor-shape update (so cursor_is_text() is meaningful)
+    virtual bool cursor_shape_known() const { return false; }
 };

@@ -53,7 +53,17 @@ public:
         const std::string& status_banner);
 
     // 2. Home '+' Menu (Touch/Mouse mode toggle, Rescan, Quick Add, Exit App)
-    std::vector<UIButton> render_home_menu(int win_w, int win_h, TouchMode tmode, int focused_idx);
+    std::vector<UIButton> render_home_menu(int win_w, int win_h, TouchMode tmode, float sensitivity, int focused_idx);
+
+    // 2b. Saved device manager (delete saved Windows / macOS devices)
+    std::vector<UIButton> render_device_manager(int win_w, int win_h, const std::vector<ConnectionProfile>& saved, int focused_idx);
+
+    // Mouse sensitivity slider (ids: sens:dec, sens:track, sens:inc). Returns track rect via out_track.
+    void render_sens_slider(int x, int y, int w, float sensitivity, std::vector<UIButton>& out);
+    static float sens_from_track_x(const SDL_Rect& track, int x);
+
+    // Floating 'open keyboard' bubble shown after tapping (macOS fallback); returns its rect
+    SDL_Rect render_kbd_bubble(int x, int y);
 
     // 3. Add / Edit / Login Connection Form Modal (Touch + Switch 2 Native Keyboard)
     std::vector<UIButton> render_connect_form(
@@ -75,6 +85,7 @@ public:
         TouchMode tmode,
         bool show_hud,
         bool auto_ime,
+        float sensitivity,
         int focused_idx);
 
     // 6. Built-in PC Special Keys Keyboard (for Ctrl/Alt/Cmd/F-keys/Arrows)

@@ -31,9 +31,11 @@ public:
     void send_text_utf8(const std::string& utf8) override;
     void request_full_refresh() override;
     bool cursor_is_text() const override { return cursor_text_.load(); }
+    bool cursor_shape_known() const override { return cursor_known_.load(); }
 
 private:
     std::atomic<bool> cursor_text_{false};
+    std::atomic<bool> cursor_known_{false};
     ConnectionProfile profile_;
     int sock_ = -1;
     std::atomic<bool> stop_{true};

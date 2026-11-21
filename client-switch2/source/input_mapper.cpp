@@ -133,8 +133,8 @@ void InputMapper::on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBa
             // Trackpad-style precision mouse movement with smooth acceleration
             float speed = std::hypot(dx, dy);
             float accel = 1.0f + clampf(speed / 28.0f, 0.0f, 1.4f);
-            vp_.cursor_x += (dx * accel) / static_cast<float>(std::max(1, vp_.dst_rect.w));
-            vp_.cursor_y += (dy * accel) / static_cast<float>(std::max(1, vp_.dst_rect.h));
+            vp_.cursor_x += (dx * accel * sensitivity_) / static_cast<float>(std::max(1, vp_.dst_rect.w));
+            vp_.cursor_y += (dy * accel * sensitivity_) / static_cast<float>(std::max(1, vp_.dst_rect.h));
             send_cursor(backend);
         } else if (direct_dragging_) {
             // Exact 1:1 direct touch drag
@@ -264,8 +264,8 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
     platform::poll_physical_hid(pm, pkeys);
     if (pm.active) {
         if (pm.dx != 0 || pm.dy != 0) {
-            vp_.cursor_x = clampf(vp_.cursor_x + pm.dx / 1920.0f, 0.0f, 1.0f);
-            vp_.cursor_y = clampf(vp_.cursor_y + pm.dy / 1080.0f, 0.0f, 1.0f);
+            vp_.cursor_x = clampf(vp_.cursor_x + pm.dx * sensitivity_ / 1920.0f, 0.0f, 1.0f);
+            vp_.cursor_y = clampf(vp_.cursor_y + pm.dy * sensitivity_ / 1080.0f, 0.0f, 1.0f);
             send_cursor(backend);
         }
         if (pm.wheel_x != 0 || pm.wheel_y != 0) {
@@ -291,8 +291,8 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
     bool sniper = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     float base_speed = sniper ? 0.22f : 0.92f;
     if (lx != 0.0f || ly != 0.0f) {
-        vp_.cursor_x += lx * base_speed * dt_sec;
-        vp_.cursor_y += ly * base_speed * dt_sec;
+        vp_.cursor_x += lx * base_speed * sensitivity_ * dt_sec;
+        vp_.cursor_y += ly * base_speed * sensitivity_ * dt_sec;
         send_cursor(backend);
     }
 

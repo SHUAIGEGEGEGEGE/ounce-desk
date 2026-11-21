@@ -109,9 +109,11 @@ private:
     uint8_t fp_frag_code_ = 0;
     std::vector<uint8_t> ptr_cache_text_;  // pointer cache index -> is I-beam text cursor
     std::atomic<bool> cursor_text_{false};
+    std::atomic<bool> cursor_known_{false};
 
 public:
     bool cursor_is_text() const override { return cursor_text_.load(); }
+    bool cursor_shape_known() const override { return cursor_known_.load(); }
 
 private:
 

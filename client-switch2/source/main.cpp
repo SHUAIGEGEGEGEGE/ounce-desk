@@ -109,6 +109,62 @@ int main(int argc, char* argv[]) {
     float tap_x0 = 0.0f, tap_y0 = 0.0f;
     float tap_max_dist = 0.0f;
     bool tap_tracking = false;
+    float last_tap_x = 960.0f, last_tap_y = 540.0f;
+
+    // Saved-device manager (home menu) + sensitivity slider + macOS keyboard bubble state
+    bool show_manage = false;
+    bool touch_block = false;  // after a modal keyboard: ignore touch until all fingers lifted
+    int manage_focus = 0;
+    bool slider_dragging = false;
+    SDL_Rect kbd_bubble{0, 0, 0, 0};
+    uint64_t kbd_bubble_until_us = 0;
+    int bubble_x = 0, bubble_y = 0;
+
+    // Persistent settings: sdmc:/switch/OunceDesk/settings.txt
+    const std::string settings_path = platform::get_config_dir() + "/settings.txt";
+    auto save_settings = [&]() {
+        FILE* f = std::fopen(settings_path.c_str(), "w");
+        if (!f) return;
+        std::fprintf(f, "sensitivity=%.2f\nauto_ime=%d\ntouch_mode=%d\n", input.sensitivity(), auto_ime ? 1 : 0,
+                     input.touch_mode() == TouchMode::MOUSE ? 1 : 0);
+        std::fclose(f);
+    };
+    {
+        FILE* f = std::fopen(settings_path.c_str(), "r");
+        if (f) {
+            char line[128];
+            while (std::fgets(line, sizeof(line), f)) {
+                float fv = 0.0f;
+                int iv = 0;
+                if (std::sscanf(line, "sensitivity=%f", &fv) == 1) input.set_sensitivity(fv);
+                else if (std::sscanf(line, "auto_ime=%d", &iv) == 1) auto_ime = (iv != 0);
+                else if (std::sscanf(line, "touch_mode=%d", &iv) == 1) input.set_touch_mode(iv ? TouchMode::MOUSE : TouchMode::TOUCH);
+            }
+            std::fclose(f);
+        }
+    }
+
+    // Returns true if the button id was a sensitivity slider control
+    auto apply_sens_control = [&](const UIButton& btn, int tap_x) -> bool {
+        if (btn.id == "sens:dec") input.set_sensitivity(input.sensitivity() - 0.1f);
+        else if (btn.id == "sens:inc") input.set_sensitivity(input.sensitivity() + 0.1f);
+        else if (btn.id == "sens:track") {
+            input.set_sensitivity(UIRenderer::sens_from_track_x(btn.rect, tap_x));
+            slider_dragging = true;
+        } else {
+            return false;
+        }
+        save_settings();
+        return true;
+    };
+    auto drag_slider_to = [&](int x) {
+        for (const auto& b : active_buttons) {
+            if (b.id == "sens:track") {
+                input.set_sensitivity(UIRenderer::sens_from_track_x(b.rect, x));
+                break;
+            }
+        }
+    };
 
     bool running = true;
 
@@ -116,7 +172,7 @@ int main(int argc, char* argv[]) {
         draft = {};
         draft.protocol = proto;
         draft.port = (proto == ProtocolType::VNC_MACOS) ? 5900 : 3389;
-        draft.host = "192.168.1.";
+        draft.host = "";
         draft.req_width = 1920;
         draft.req_height = 1080;
         form_focus = 1;
@@ -127,7 +183,7 @@ int main(int argc, char* argv[]) {
 
     auto start_connection = [&](const ConnectionProfile& p) {
         if (p.host.empty()) {
-            form_error = "请输入电脑 IP 地址";
+            form_error = "请输入电脑 IP / IPv6 地址或 DDNS 域名";
             return;
         }
         active_profile = p;
@@ -161,7 +217,7 @@ int main(int argc, char* argv[]) {
             draft.port = (draft.protocol == ProtocolType::VNC_MACOS) ? 5900 : 3389;
         } else if (field_idx == 1) {
             std::string v;
-            if (platform::show_system_keyboard("请输入电脑 IP 地址 (如 192.168.33.186)", draft.host, v, false, false)) {
+            if (platform::show_system_keyboard("输入 IP / IPv6 / DDNS 域名 (可加 :端口，如 myhome.ddns.net:3390)", draft.host, v, false, false)) {
                 draft.host = v;
             }
         } else if (field_idx == 2) {
@@ -208,6 +264,13 @@ int main(int argc, char* argv[]) {
     auto handle_home_menu_action = [&](const std::string& id) {
         if (id == "hm:mode") {
             input.toggle_touch_mode();
+            save_settings();
+        } else if (id == "hm:manage") {
+            show_manage = true;
+            manage_focus = 0;
+        } else if (id == "sens:dec" || id == "sens:inc") {
+            input.set_sensitivity(input.sensitivity() + (id == "sens:inc" ? 0.1f : -0.1f));
+            save_settings();
         } else if (id == "hm:scan") {
             profiles.start_lan_scan();
             show_home_menu = false;
@@ -230,8 +293,13 @@ int main(int argc, char* argv[]) {
             show_overlay = false;
         } else if (id == "act:touch_mode") {
             input.toggle_touch_mode();
+            save_settings();
+        } else if (id == "sens:dec" || id == "sens:inc") {
+            input.set_sensitivity(input.sensitivity() + (id == "sens:inc" ? 0.1f : -0.1f));
+            save_settings();
         } else if (id == "act:auto_ime") {
             auto_ime = !auto_ime;
+            save_settings();
         } else if (id == "act:refresh") {
             backend->request_full_refresh();
             show_overlay = false;
@@ -315,10 +383,27 @@ int main(int argc, char* argv[]) {
         // Unified UI tap dispatcher (works identically for Switch 2 native touch AND Desktop mouse)
         auto dispatch_ui_tap = [&](int tap_x, int tap_y) {
             if (mode == AppMode::BROWSER) {
+                if (show_manage) {
+                    for (const auto& btn : active_buttons) {
+                        if (!UIRenderer::hit_test(btn.rect, tap_x, tap_y)) continue;
+                        if (btn.id == "dm:back") {
+                            show_manage = false;
+                        } else if (btn.id.rfind("dm:del:", 0) == 0) {
+                            size_t idx = static_cast<size_t>(std::atoi(btn.id.c_str() + 7));
+                            auto saved = profiles.saved_profiles();
+                            if (idx < saved.size()) {
+                                profiles.remove_saved(saved[idx], profiles_path);
+                                status_banner = "已删除设备: " + saved[idx].name;
+                            }
+                        }
+                        break;
+                    }
+                    return;
+                }
                 if (show_home_menu) {
                     for (const auto& btn : active_buttons) {
                         if (UIRenderer::hit_test(btn.rect, tap_x, tap_y)) {
-                            handle_home_menu_action(btn.id);
+                            if (!apply_sens_control(btn, tap_x)) handle_home_menu_action(btn.id);
                             break;
                         }
                     }
@@ -328,7 +413,7 @@ int main(int argc, char* argv[]) {
                     if (!UIRenderer::hit_test(btn.rect, tap_x, tap_y)) continue;
                     if (btn.id == "add_rdp") open_new_form(ProtocolType::RDP_WINDOWS);
                     else if (btn.id == "add_mac") open_new_form(ProtocolType::VNC_MACOS);
-                    else if (btn.id == "home_mode") input.toggle_touch_mode();
+                    else if (btn.id == "home_mode") { input.toggle_touch_mode(); save_settings(); }
                     else if (btn.id == "scan_lan") {
                         profiles.start_lan_scan();
                         status_banner = "正在扫描局域网内的 Windows (3389) 与 macOS (5900) 电脑...";
@@ -371,7 +456,10 @@ int main(int argc, char* argv[]) {
             } else if (mode == AppMode::STREAMING && backend) {
                 if (show_overlay) {
                     for (const auto& btn : active_buttons) {
-                        if (UIRenderer::hit_test(btn.rect, tap_x, tap_y)) { handle_overlay_action(btn.id); break; }
+                        if (UIRenderer::hit_test(btn.rect, tap_x, tap_y)) {
+                            if (!apply_sens_control(btn, tap_x)) handle_overlay_action(btn.id);
+                            break;
+                        }
                     }
                 } else if (show_osk) {
                     for (const auto& k : active_osk) {
@@ -387,6 +475,11 @@ int main(int argc, char* argv[]) {
             platform::poll_native_touch(cur_pts);
             std::map<uint32_t, platform::NativeTouchPoint> cur_map;
             for (const auto& pt : cur_pts) cur_map[pt.id] = pt;
+            if (touch_block) {
+                if (cur_map.empty()) touch_block = false;
+                prev_native_touches.clear();
+                cur_map.clear();
+            }
 
             // Newly pressed fingers (DOWN)
             for (const auto& kv : cur_map) {
@@ -394,6 +487,17 @@ int main(int argc, char* argv[]) {
                     int tx = static_cast<int>(kv.second.x);
                     int ty = static_cast<int>(kv.second.y);
                     if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
+                        // Floating "open keyboard" bubble (macOS fallback): tap it -> Switch 2 keyboard; tap anywhere else -> dismiss
+                        if (kbd_bubble_until_us != 0) {
+                            bool hit_bubble = UIRenderer::hit_test(kbd_bubble, tx, ty);
+                            kbd_bubble_until_us = 0;
+                            if (hit_bubble) {
+                                tap_tracking = false;
+                                open_streaming_swkbd();
+                                touch_block = true;  // ignore touches until all fingers are lifted
+                                break;
+                            }
+                        }
                         if (cur_map.size() == 1 && prev_native_touches.empty()) {
                             tap_tracking = true;
                             tap_down_us = now;
@@ -422,7 +526,14 @@ int main(int argc, char* argv[]) {
                         tap_max_dist = std::max(tap_max_dist, dx * dx + dy * dy);
                     }
                     input.on_touch_move(kv.first, kv.second.x, kv.second.y, *backend, LOGICAL_W, LOGICAL_H);
+                } else if (slider_dragging && (show_home_menu || show_overlay)) {
+                    // Drag the mouse sensitivity slider knob
+                    drag_slider_to(static_cast<int>(kv.second.x));
                 }
+            }
+            if (slider_dragging && cur_map.empty()) {
+                slider_dragging = false;
+                save_settings();
             }
             // Released fingers (UP)
             for (const auto& kv : prev_native_touches) {
@@ -433,12 +544,15 @@ int main(int argc, char* argv[]) {
                             // Short, still, single-finger tap -> check remote cursor shape shortly after click
                             if (now - tap_down_us < 450000ULL && tap_max_dist < 40.0f * 40.0f) {
                                 ime_check_at_us = now + 320000ULL;
+                                last_tap_x = tap_x0;
+                                last_tap_y = tap_y0;
                             }
                             tap_tracking = false;
                         }
                     }
                 }
             }
+            if (touch_block) cur_map.clear();
             prev_native_touches = std::move(cur_map);
         }
 
@@ -458,7 +572,32 @@ int main(int argc, char* argv[]) {
             int dtap_y = desktop_tap ? ev.button.y : 0;
 
             if (mode == AppMode::BROWSER) {
+                if (show_manage) {
+                    if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
+                        auto b = ev.cbutton.button;
+                        int n = static_cast<int>(active_buttons.size());
+                        if (b == SDL_CONTROLLER_BUTTON_B) show_manage = false;
+                        else if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && n > 0) manage_focus = (manage_focus + 1) % n;
+                        else if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && n > 0) manage_focus = (manage_focus - 1 + n) % n;
+                        else if (b == SDL_CONTROLLER_BUTTON_A && manage_focus < n) {
+                            const SDL_Rect& r = active_buttons[manage_focus].rect;
+                            dispatch_ui_tap(r.x + r.w / 2, r.y + r.h / 2);
+                            manage_focus = 0;
+                        }
+                    } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
+                        show_manage = false;
+                    } else if (desktop_tap) {
+                        dispatch_ui_tap(dtap_x, dtap_y);
+                    }
+                    continue;
+                }
                 if (show_home_menu) {
+                    if (ev.type == SDL_CONTROLLERBUTTONDOWN &&
+                        (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT || ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) {
+                        input.set_sensitivity(input.sensitivity() + (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT ? 0.1f : -0.1f));
+                        save_settings();
+                        continue;
+                    }
                     if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
                         auto b = ev.cbutton.button;
                         if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_START) show_home_menu = false;
@@ -589,6 +728,11 @@ int main(int argc, char* argv[]) {
                         overlay_focus = 0;
                         continue;
                     }
+                    if (desktop_tap && kbd_bubble_until_us != 0) {
+                        bool hit_b = UIRenderer::hit_test(kbd_bubble, dtap_x, dtap_y);
+                        kbd_bubble_until_us = 0;
+                        if (hit_b) { open_streaming_swkbd(); continue; }
+                    }
                     bool open_swkbd = false;
                     if (input.handle_sdl_event(ev, *backend, LOGICAL_W, LOGICAL_H, open_swkbd)) {
                         show_overlay = true;
@@ -600,6 +744,8 @@ int main(int argc, char* argv[]) {
                     // Desktop build: left click release also triggers the text-box check
                     if (!platform::uses_native_touch() && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
                         ime_check_at_us = platform::now_us() + 320000ULL;
+                        last_tap_x = static_cast<float>(ev.button.x);
+                        last_tap_y = static_cast<float>(ev.button.y);
                     }
                     // Gamepad A (left click) also triggers the text-box check in mouse mode
                     if (ev.type == SDL_CONTROLLERBUTTONUP && ev.cbutton.button == SDL_CONTROLLER_BUTTON_A) {
@@ -616,16 +762,35 @@ int main(int argc, char* argv[]) {
         // Auto-open Switch 2 native keyboard when the tap landed on a remote text input (I-beam cursor)
         if (ime_check_at_us != 0 && platform::now_us() >= ime_check_at_us) {
             ime_check_at_us = 0;
-            if (auto_ime && mode == AppMode::STREAMING && backend && !show_overlay && !show_osk &&
-                backend->cursor_is_text()) {
-                platform::log_line("[UI] Tap on remote text field -> opening Switch 2 keyboard");
-                std::string typed;
-                if (platform::show_system_keyboard("请输入文字 (点取消/空白处返回)", "", typed, false, false)) {
-                    if (!typed.empty()) backend->send_text_utf8(typed);
+            if (auto_ime && mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
+                if (backend->cursor_is_text()) {
+                    platform::log_line("[UI] Tap on remote text field -> opening Switch 2 keyboard");
+                    std::string typed;
+                    if (platform::show_system_keyboard("请输入文字 (点取消/空白处返回)", "", typed, false, false)) {
+                        if (!typed.empty()) backend->send_text_utf8(typed);
+                    }
+                    prev_native_touches.clear();
+                    touch_block = true;
+                    last_us = platform::now_us();
+                } else if (backend->protocol() == ProtocolType::VNC_MACOS || !backend->cursor_shape_known()) {
+                    // macOS Screen Sharing often does not report the I-beam cursor shape -> show a small
+                    // floating "keyboard" bubble next to the tap. Tap it = Switch 2 keyboard; tap elsewhere = dismiss.
+                    float px = last_tap_x, py = last_tap_y;
+                    if (input.touch_mode() == TouchMode::MOUSE) {
+                        const auto& vp = input.viewport();
+                        px = vp.dst_rect.x + vp.cursor_x * vp.dst_rect.w;
+                        py = vp.dst_rect.y + vp.cursor_y * vp.dst_rect.h;
+                    }
+                    bubble_x = std::max(10, std::min(LOGICAL_W - 260, static_cast<int>(px) + 24));
+                    bubble_y = static_cast<int>(py) - 100;
+                    if (bubble_y < 70) bubble_y = static_cast<int>(py) + 50;
+                    bubble_y = std::max(10, std::min(LOGICAL_H - 74, bubble_y));
+                    kbd_bubble_until_us = platform::now_us() + 3000000ULL;
                 }
-                prev_native_touches.clear();
-                last_us = platform::now_us();
             }
+        }
+        if (kbd_bubble_until_us != 0 && (platform::now_us() > kbd_bubble_until_us || mode != AppMode::STREAMING || show_overlay)) {
+            kbd_bubble_until_us = 0;
         }
 
         // Render frame in exact 1920x1080 logical space
@@ -635,8 +800,10 @@ int main(int argc, char* argv[]) {
                 profiles.is_scanning(), profiles.scan_progress_pct(), input.touch_mode(), status_banner);
             if (mode == AppMode::FORM) {
                 active_buttons = ui.render_connect_form(LOGICAL_W, LOGICAL_H, draft, form_focus, form_error);
+            } else if (show_manage) {
+                active_buttons = ui.render_device_manager(LOGICAL_W, LOGICAL_H, profiles.saved_profiles(), manage_focus);
             } else if (show_home_menu) {
-                active_buttons = ui.render_home_menu(LOGICAL_W, LOGICAL_H, input.touch_mode(), home_menu_focus);
+                active_buttons = ui.render_home_menu(LOGICAL_W, LOGICAL_H, input.touch_mode(), input.sensitivity(), home_menu_focus);
             }
         } else if (mode == AppMode::CONNECTING && backend) {
             SDL_SetRenderDrawColor(renderer, 11, 15, 25, 255);
@@ -661,11 +828,14 @@ int main(int argc, char* argv[]) {
                 ui.render_cursor(input.viewport());
             }
             menu_pill = ui.render_menu_pill(LOGICAL_W, LOGICAL_H);
+            if (kbd_bubble_until_us != 0 && !show_overlay && !show_osk) {
+                kbd_bubble = ui.render_kbd_bubble(bubble_x, bubble_y);
+            }
             auto st = backend->stats();
             if (show_hud) ui.render_perf_hud(LOGICAL_W, LOGICAL_H, st, input.touch_mode(), input.viewport().zoom);
             if (show_overlay) {
                 active_buttons = ui.render_quick_overlay(
-                    LOGICAL_W, LOGICAL_H, active_profile, st, input.touch_mode(), show_hud, auto_ime, overlay_focus);
+                    LOGICAL_W, LOGICAL_H, active_profile, st, input.touch_mode(), show_hud, auto_ime, input.sensitivity(), overlay_focus);
             } else if (show_osk) {
                 active_osk = ui.render_osk(LOGICAL_W, LOGICAL_H, active_profile.protocol, osk_sticky_mods, osk_focus);
             }

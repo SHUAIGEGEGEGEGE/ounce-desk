@@ -2,6 +2,7 @@
 
 #include "crypto_utils.hpp"
 #include "cursor_detect.hpp"
+#include "net_connect.hpp"
 #include "keymap.hpp"
 #include "platform.hpp"
 
@@ -80,6 +81,7 @@ bool VncBackend::connect_async(const ConnectionProfile& profile) {
     disconnect();
     profile_ = profile;
     if (profile_.port == 0) profile_.port = 5900;
+    netc::split_host_port(profile.host, profile_.host, profile_.port);
     stop_.store(false);
     state_.store(BackendState::CONNECTING);
     set_status("Connecting to " + profile_.host + ":" + std::to_string(profile_.port) + " (VNC/macOS)...");
@@ -499,41 +501,14 @@ void VncBackend::run_session() {
             CLOSE_SOCK(sock_);
             sock_ = -1;
         }
-        addrinfo hints{}, *res = nullptr;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(profile_.host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res) {
-            set_error("无法解析主机: " + profile_.host);
-            return false;
-        }
-
-        int s = static_cast<int>(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+        std::string cerr, caddr;
+        int s = netc::tcp_connect(profile_.host, profile_.port, 6000, cerr, &caddr);
         if (s < 0) {
-            freeaddrinfo(res);
-            set_error("创建套接字失败");
+            set_error(cerr + " (请检查 Mac 屏幕共享是否开启，外网需路由器转发 5900 端口)");
             return false;
         }
-        int one = 1;
-        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
-#ifdef _WIN32
-        DWORD tv = 5000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-        timeval tv{5, 0};
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
-
-        if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
-            freeaddrinfo(res);
-            CLOSE_SOCK(s);
-            set_error("无法连接 " + profile_.host + ":" + port_s + " (请检查 Mac 屏幕共享是否开启)");
-            return false;
-        }
-        freeaddrinfo(res);
+        platform::log_line("[VNC] TCP connected to " + caddr + ":" + port_s);
         sock_ = s;
-
         state_.store(BackendState::AUTHENTICATING);
         set_status("正在与 macOS 屏幕共享握手 (RFB 3.8)...");
         char ver[13]{};
@@ -762,7 +737,10 @@ void VncBackend::run_session() {
                         for (int y = 0; y < rh; ++y)
                             for (int x = 0; x < rw; ++x)
                                 vis[static_cast<size_t>(y) * rw + x] = (mask[y * mask_stride + x / 8] >> (7 - (x % 8))) & 1;
-                        cursor_text_.store(cursor_detect::is_ibeam(vis, rw, rh, rx, ry));
+                        bool txt = cursor_detect::is_ibeam(vis, rw, rh, rx, ry);
+                        if (!cursor_known_.load()) platform::log_line("[VNC] Server supports cursor-shape updates");
+                        cursor_known_.store(true);
+                        cursor_text_.store(txt);
                     } else {
                         cursor_text_.store(false);
                     }

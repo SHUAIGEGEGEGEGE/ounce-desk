@@ -302,25 +302,25 @@ std::vector<UIButton> UIRenderer::render_profile_browser(
     return buttons;
 }
 
-std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMode tmode, int focused_idx) {
+std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMode tmode, float sensitivity, int focused_idx) {
     std::vector<UIButton> buttons;
 
     SDL_SetRenderDrawColor(renderer_, 5, 8, 16, 195);
     SDL_Rect full{0, 0, win_w, win_h};
     SDL_RenderFillRect(renderer_, &full);
 
-    int pw = 720;
-    int ph = 560;
+    int pw = 760;
+    int ph = 736;
     SDL_Rect panel{(win_w - pw) / 2, (win_h - ph) / 2, pw, ph};
     draw_panel(panel, COL_PANEL, COL_ACCENT);
 
-    draw_text(panel.x + 36, panel.y + 24, "OunceDesk 主菜单 (+)", COL_TEXT, 3);
+    draw_text(panel.x + 36, panel.y + 22, "OunceDesk 主菜单 (+)", COL_TEXT, 3);
 
     int bx = panel.x + 48;
     int bw = pw - 96;
-    int y = panel.y + 92;
-    const int bh = 66;
-    const int gap = 14;
+    int y = panel.y + 84;
+    const int bh = 60;
+    const int gap = 12;
 
     buttons.push_back({{bx, y, bw, bh}, "hm:mode",
                        (tmode == TouchMode::TOUCH) ? "控制模式: 触屏直触 (点击切换为鼠标模式)"
@@ -329,18 +329,123 @@ std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMo
     y += bh + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:scan", "重新扫描局域网 (Windows 3389 / macOS 5900)", false, false, false});
     y += bh + gap;
-    buttons.push_back({{bx, y, bw, bh}, "hm:add_rdp", "手动添加 Windows 远程桌面 (端口 3389)", false, false, false});
+    buttons.push_back({{bx, y, bw, bh}, "hm:add_rdp", "添加 Windows 远程桌面 (IP / IPv6 / DDNS 域名)", false, false, false});
     y += bh + gap;
-    buttons.push_back({{bx, y, bw, bh}, "hm:add_mac", "手动添加 苹果 macOS 屏幕共享 (端口 5900)", false, false, false});
+    buttons.push_back({{bx, y, bw, bh}, "hm:add_mac", "添加 苹果 macOS 屏幕共享 (IP / IPv6 / DDNS 域名)", false, false, false});
+    y += bh + gap;
+    buttons.push_back({{bx, y, bw, bh}, "hm:manage", "管理 / 删除已添加的设备", false, false, false});
+    y += bh + gap;
+    // Mouse sensitivity slider row
+    render_sens_slider(bx, y, bw, sensitivity, buttons);
     y += bh + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:resume", "关闭菜单", false, true, false});
     y += bh + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:exit", "退出软件 (返回系统 / hbmenu)", false, false, true});
 
     for (size_t i = 0; i < buttons.size(); ++i) {
+        if (buttons[i].id.rfind("sens:", 0) == 0) {
+            if (static_cast<int>(i) == focused_idx) {
+                SDL_Rect o{buttons[i].rect.x - 3, buttons[i].rect.y - 3, buttons[i].rect.w + 6, buttons[i].rect.h + 6};
+                SDL_SetRenderDrawColor(renderer_, COL_ACCENT.r, COL_ACCENT.g, COL_ACCENT.b, 255);
+                SDL_RenderDrawRect(renderer_, &o);
+            }
+            continue;
+        }
         draw_button(buttons[i], static_cast<int>(i) == focused_idx);
     }
+    draw_text(panel.x + 48, panel.y + ph - 34, "提示: 十字键 左/右 也可直接调节鼠标灵敏度", COL_MUTED, 2);
     return buttons;
+}
+
+float UIRenderer::sens_from_track_x(const SDL_Rect& track, int x) {
+    float t = static_cast<float>(x - track.x) / static_cast<float>(std::max(1, track.w));
+    t = std::max(0.0f, std::min(1.0f, t));
+    float s = 0.2f + t * 2.8f;
+    return static_cast<float>(static_cast<int>(s * 10.0f + 0.5f)) / 10.0f;  // snap to 0.1x
+}
+
+void UIRenderer::render_sens_slider(int x, int y, int w, float sensitivity, std::vector<UIButton>& out) {
+    const int h = 60;
+    SDL_Rect box{x, y, w, h};
+    draw_panel(box, COL_CARD, COL_BORDER);
+    char lbl[64];
+    std::snprintf(lbl, sizeof(lbl), "鼠标灵敏度 %.1fx", sensitivity);
+    draw_text(x + 16, y + 18, lbl, COL_TEXT, 2);
+
+    const int label_w = 210;
+    const int btn_w = 60;
+    UIButton dec{{x + label_w, y + 6, btn_w, h - 12}, "sens:dec", "-", false, false, false};
+    UIButton inc{{x + w - btn_w - 10, y + 6, btn_w, h - 12}, "sens:inc", "+", false, false, false};
+    draw_button(dec, false);
+    draw_button(inc, false);
+
+    // Track (touch / drag area is the full height of the row between - and +)
+    SDL_Rect hit{dec.rect.x + btn_w + 16, y, inc.rect.x - (dec.rect.x + btn_w + 16) - 16, h};
+    SDL_Rect bar{hit.x, y + h / 2 - 5, hit.w, 10};
+    draw_panel(bar, {15, 23, 42, 255}, COL_BORDER);
+    float t = (sensitivity - 0.2f) / 2.8f;
+    t = std::max(0.0f, std::min(1.0f, t));
+    SDL_Rect fill{bar.x, bar.y, static_cast<int>(bar.w * t), bar.h};
+    SDL_SetRenderDrawColor(renderer_, COL_ACCENT.r, COL_ACCENT.g, COL_ACCENT.b, 255);
+    SDL_RenderFillRect(renderer_, &fill);
+    // 1.0x tick
+    int tick_x = bar.x + static_cast<int>(bar.w * (0.8f / 2.8f));
+    SDL_SetRenderDrawColor(renderer_, COL_MUTED.r, COL_MUTED.g, COL_MUTED.b, 255);
+    SDL_RenderDrawLine(renderer_, tick_x, bar.y - 8, tick_x, bar.y + bar.h + 8);
+    // Knob
+    int kx = bar.x + static_cast<int>(bar.w * t);
+    SDL_Rect knob{kx - 14, y + h / 2 - 18, 28, 36};
+    draw_panel(knob, COL_TEXT, COL_ACCENT);
+
+    out.push_back(dec);
+    out.push_back({hit, "sens:track", "", false, false, false});
+    out.push_back(inc);
+}
+
+std::vector<UIButton> UIRenderer::render_device_manager(int win_w, int win_h, const std::vector<ConnectionProfile>& saved, int focused_idx) {
+    std::vector<UIButton> buttons;
+    SDL_SetRenderDrawColor(renderer_, 5, 8, 16, 205);
+    SDL_Rect full{0, 0, win_w, win_h};
+    SDL_RenderFillRect(renderer_, &full);
+
+    int pw = 1100;
+    int ph = 860;
+    SDL_Rect panel{(win_w - pw) / 2, (win_h - ph) / 2, pw, ph};
+    draw_panel(panel, COL_PANEL, COL_ACCENT);
+    draw_text(panel.x + 36, panel.y + 22, "管理已添加的设备", COL_TEXT, 3);
+    draw_text(panel.x + 36, panel.y + 66, "点击右侧「删除」即可移除该设备 (连同保存的账户密码)", COL_MUTED, 2);
+
+    int y = panel.y + 108;
+    const int row_h = 72;
+    const int max_rows = 9;
+    if (saved.empty()) {
+        draw_text(panel.x + 36, y + 20, "还没有已保存的设备。", COL_MUTED, 2);
+    }
+    for (size_t i = 0; i < saved.size() && static_cast<int>(i) < max_rows; ++i) {
+        const auto& p = saved[i];
+        bool is_mac = (p.protocol == ProtocolType::VNC_MACOS);
+        SDL_Rect row{panel.x + 36, y, pw - 72, row_h - 10};
+        draw_panel(row, COL_CARD, COL_BORDER);
+        SDL_Rect badge{row.x + 12, row.y + 14, 110, 34};
+        draw_panel(badge, is_mac ? COL_MAC : COL_WIN, is_mac ? COL_MAC : COL_WIN);
+        draw_text(badge.x + 10, badge.y + 7, is_mac ? "Mac 5900" : "Win 3389", {10, 15, 25, 255}, 2);
+        char info[256];
+        std::snprintf(info, sizeof(info), "%s   %s:%u   %s", p.name.c_str(), p.host.c_str(), p.port,
+                      p.username.empty() ? "" : ("账户: " + p.username).c_str());
+        draw_text(row.x + 138, row.y + 18, info, COL_TEXT, 2);
+        buttons.push_back({{row.x + row.w - 150, row.y + 8, 138, row.h - 16}, "dm:del:" + std::to_string(i), "删除", false, false, true});
+        y += row_h;
+    }
+    buttons.push_back({{panel.x + (pw - 320) / 2, panel.y + ph - 86, 320, 62}, "dm:back", "返回主菜单", false, true, false});
+    for (size_t i = 0; i < buttons.size(); ++i) draw_button(buttons[i], static_cast<int>(i) == focused_idx);
+    return buttons;
+}
+
+SDL_Rect UIRenderer::render_kbd_bubble(int x, int y) {
+    SDL_Rect r{x, y, 250, 64};
+    draw_panel(r, {14, 116, 144, 240}, COL_ACCENT);
+    draw_text(r.x + 22, r.y + 18, "[键盘] 点此输入文字", COL_TEXT, 2);
+    return r;
 }
 
 std::vector<UIButton> UIRenderer::render_connect_form(
@@ -371,7 +476,7 @@ std::vector<UIButton> UIRenderer::render_connect_form(
     struct Row { const char* id; const char* title; std::string val; };
     std::vector<Row> rows = {
         {"f:proto", "系统协议类型 (点击切换)", is_mac ? "苹果 macOS 屏幕共享 / VNC (端口 5900)" : "Windows 远程桌面 / RDP (端口 3389)"},
-        {"f:host",  "电脑 IP 地址 [系统原生键盘]", draft.host.empty() ? "(点击输入电脑 IP，例如 192.168.33.186)" : draft.host},
+        {"f:host",  "电脑地址: IPv4 / IPv6 / DDNS 域名 [系统原生键盘]", draft.host.empty() ? "(例如 192.168.33.186 / 2408:8000::1 / myhome.ddns.net)" : draft.host},
         {"f:port",  "TCP 端口号 [数字键盘]",  std::to_string(draft.port)},
         {"f:user",  is_mac ? "macOS 登录用户名 [系统原生键盘]" : "Windows 登录用户名 [系统原生键盘]",
                     draft.username.empty() ? (is_mac ? "(输入 Mac 用户名；若仅用 VNC 密码可留空)" : "(点击输入 Windows 账户名)") : draft.username},
@@ -452,6 +557,7 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     TouchMode tmode,
     bool show_hud,
     bool auto_ime,
+    float sensitivity,
     int focused_idx) {
 
     std::vector<UIButton> buttons;
@@ -461,7 +567,7 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     SDL_RenderFillRect(renderer_, &full);
 
     int pw = std::min(win_w - 100, 1500);
-    int ph = 520;
+    int ph = 600;
     SDL_Rect panel{(win_w - pw) / 2, (win_h - ph) / 2, pw, ph};
     draw_panel(panel, COL_PANEL, COL_ACCENT);
 
@@ -512,7 +618,18 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     buttons.push_back({{panel.x + 32 + 4 * (bw + 14), panel.y + 320, bw, 66}, "act:exit_app",
                        "退出软件", false, false, true});
 
+    // Row 4: Mouse sensitivity slider
+    render_sens_slider(panel.x + 32, panel.y + 410, pw - 64, sensitivity, buttons);
+
     for (size_t i = 0; i < buttons.size(); ++i) {
+        if (buttons[i].id.rfind("sens:", 0) == 0) {
+            if (static_cast<int>(i) == focused_idx) {
+                SDL_Rect o{buttons[i].rect.x - 3, buttons[i].rect.y - 3, buttons[i].rect.w + 6, buttons[i].rect.h + 6};
+                SDL_SetRenderDrawColor(renderer_, COL_ACCENT.r, COL_ACCENT.g, COL_ACCENT.b, 255);
+                SDL_RenderDrawRect(renderer_, &o);
+            }
+            continue;
+        }
         draw_button(buttons[i], static_cast<int>(i) == focused_idx);
     }
 

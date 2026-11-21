@@ -2,6 +2,7 @@
 
 #include "crypto_utils.hpp"
 #include "cursor_detect.hpp"
+#include "net_connect.hpp"
 #include "keymap.hpp"
 #include "platform.hpp"
 
@@ -507,6 +508,7 @@ bool RdpBackend::connect_async(const ConnectionProfile& profile) {
     disconnect();
     profile_ = profile;
     if (profile_.port == 0) profile_.port = 3389;
+    netc::split_host_port(profile.host, profile_.host, profile_.port);
     if (profile_.req_width < 640) profile_.req_width = 1920;
     if (profile_.req_height < 480) profile_.req_height = 1080;
 
@@ -1496,6 +1498,7 @@ void RdpBackend::handle_pointer_attr(const uint8_t* data, size_t len, int xor_bp
         }
     }
     bool text = cursor_detect::is_ibeam(vis, w, h, hx, hy);
+    cursor_known_.store(true);
     if (cache_idx >= ptr_cache_text_.size()) ptr_cache_text_.resize(cache_idx + 1, 0);
     ptr_cache_text_[cache_idx] = text ? 1 : 0;
     cursor_text_.store(text);
@@ -1727,43 +1730,16 @@ void RdpBackend::request_full_refresh() {
 }
 
 void RdpBackend::run_session() {
-    // 1. Resolve & TCP connect to Windows Port 3389
-    addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    std::string port_s = std::to_string(profile_.port);
-    if (getaddrinfo(profile_.host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res) {
-        set_error("Cannot resolve Windows host: " + profile_.host);
-        return;
-    }
-
-    int s = static_cast<int>(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+    // 1. Resolve (IPv4 / IPv6 / DDNS domain) & TCP connect
+    set_status("正在解析并连接 " + profile_.host + ":" + std::to_string(profile_.port) + " ...");
+    std::string cerr, caddr;
+    int s = netc::tcp_connect(profile_.host, profile_.port, 6000, cerr, &caddr);
     if (s < 0) {
-        freeaddrinfo(res);
-        set_error("Socket creation failed");
+        set_error(cerr + " (请确认 Windows 已开启远程桌面，外网需路由器转发 3389 端口)");
         return;
     }
-    int one = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
-#ifdef _WIN32
-    DWORD tv = 5000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    timeval tv{5, 0};
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
-
-    if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
-        freeaddrinfo(res);
-        CLOSE_SOCK(s);
-        set_error("Cannot connect to " + profile_.host + ":" + port_s + " (Enable Windows Remote Desktop)");
-        return;
-    }
-    freeaddrinfo(res);
+    platform::log_line("[RDP] TCP connected to " + caddr + ":" + std::to_string(profile_.port));
     sock_ = s;
-
     // 2. X.224 Security Protocol Negotiation
     state_.store(BackendState::AUTHENTICATING);
     uint32_t selected_proto = 0;

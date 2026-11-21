@@ -37,6 +37,10 @@ public:
         set_touch_mode((touch_mode_ == TouchMode::TOUCH) ? TouchMode::MOUSE : TouchMode::TOUCH);
     }
 
+    // Mouse sensitivity multiplier (0.2x .. 3.0x), applied to trackpad, stick and USB mouse movement
+    void set_sensitivity(float s) { sensitivity_ = (s < 0.2f) ? 0.2f : (s > 3.0f ? 3.0f : s); }
+    float sensitivity() const { return sensitivity_; }
+
     ViewportState& viewport() { return vp_; }
     const ViewportState& viewport() const { return vp_; }
 
@@ -62,6 +66,7 @@ public:
 
 private:
     TouchMode touch_mode_ = TouchMode::TOUCH;
+    float sensitivity_ = 1.0f;
     ViewportState vp_;
 
     struct FingerInfo {

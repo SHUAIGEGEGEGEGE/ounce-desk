@@ -32,6 +32,10 @@ public:
     std::vector<ConnectionProfile> windows_profiles() const;
     std::vector<ConnectionProfile> macos_profiles() const;
     std::vector<ConnectionProfile> all_profiles() const;
+    std::vector<ConnectionProfile> saved_profiles() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return saved_;
+    }
 
 private:
     mutable std::mutex mu_;
