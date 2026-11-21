@@ -93,7 +93,7 @@ class TestProtocolConstants(unittest.TestCase):
             "do_mcs_connect",
             "do_client_info_pdu",
             "handle_demand_active",
-            "decompress_rdp_rle",
+            "decompress_interleaved", "decompress_planar",
             "PDUTYPE_DEACTIVATEALLPDU",
             "FASTPATH_UPDATETYPE_BITMAP",
             "FASTPATH_INPUT_EVENT_MOUSE",
