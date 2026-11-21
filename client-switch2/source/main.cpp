@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "input_mapper.hpp"
+#include "keymap.hpp"
 #include "platform.hpp"
 #include "profiles.hpp"
 #include "rdp_backend.hpp"
@@ -125,6 +126,9 @@ int main(int argc, char* argv[]) {
     float tap_max_dist = 0.0f;
     bool tap_tracking = false;
     float last_tap_x = 960.0f, last_tap_y = 540.0f;
+    std::string remote_typed_buf;
+    float remote_typed_nx = -10.0f;
+    float remote_typed_ny = -10.0f;
 
     // Saved-device manager (home menu) + WireGuard manager + sensitivity slider + macOS keyboard bubble state
     bool show_manage = false;
@@ -246,6 +250,9 @@ int main(int argc, char* argv[]) {
         if (active_profile.name.empty()) {
             active_profile.name = active_profile.host;
         }
+        remote_typed_buf.clear();
+        remote_typed_nx = -10.0f;
+        remote_typed_ny = -10.0f;
         if (also_save) {
             profiles.add_or_update(active_profile, profiles_path);
         }
@@ -289,8 +296,12 @@ int main(int argc, char* argv[]) {
         } else if (field_idx == 3) {
             std::string v;
             if (platform::show_system_keyboard("请输入端口号 (Windows 3389 / Mac 5900)", std::to_string(draft.port), v, true, false)) {
-                int p = std::atoi(v.c_str());
-                if (p > 0 && p <= 65535) draft.port = static_cast<uint16_t>(p);
+                if (v.empty()) {
+                    draft.port = (draft.protocol == ProtocolType::VNC_MACOS) ? 5900 : 3389;
+                } else {
+                    int p = std::atoi(v.c_str());
+                    if (p > 0 && p <= 65535) draft.port = static_cast<uint16_t>(p);
+                }
             }
         } else if (field_idx == 4) {
             std::string v;
@@ -313,11 +324,84 @@ int main(int argc, char* argv[]) {
 
     uint64_t last_us = platform::now_us();
 
+    auto utf8_codepoint_len = [](const std::string& s) -> size_t {
+        size_t pos = 0, cnt = 0;
+        while (pos < s.size()) {
+            if (keymap::next_utf8_codepoint(s.data(), s.size(), pos) == 0) break;
+            ++cnt;
+        }
+        return cnt;
+    };
+
+    auto current_remote_norm = [&](float& out_nx, float& out_ny) {
+        const auto& vp = input.viewport();
+        out_nx = vp.cursor_x;
+        out_ny = vp.cursor_y;
+        if (input.touch_mode() == TouchMode::TOUCH && vp.dst_rect.w > 0 && vp.dst_rect.h > 0) {
+            out_nx = (last_tap_x - static_cast<float>(vp.dst_rect.x)) / static_cast<float>(vp.dst_rect.w);
+            out_ny = (last_tap_y - static_cast<float>(vp.dst_rect.y)) / static_cast<float>(vp.dst_rect.h);
+        }
+    };
+
     auto open_streaming_swkbd = [&]() {
         if (!backend) return;
+        float nx = 0.5f, ny = 0.5f;
+        current_remote_norm(nx, ny);
+        float dx = nx - remote_typed_nx;
+        float dy = ny - remote_typed_ny;
+        // Same input box if within ~12% horizontal and ~5% vertical of where we last typed
+        bool same_field = (!remote_typed_buf.empty() && (dx * dx < 0.12f * 0.12f) && (dy * dy < 0.05f * 0.05f));
+
+        // Prepend 24 Zero-Width Spaces (U+200B, 3 bytes each: E2 80 8B) BEFORE the remembered text:
+        //  - Visually 0-width invisible in Switch 2's nintendo_udsg system font!
+        //  - Gives the user 24 Backspace presses even when the remote input box already had characters not typed by us!
+        constexpr const char* ZWS = "\xE2\x80\x8B";
+        constexpr size_t ANCHOR_COUNT = 24;
+        std::string seed;
+        seed.reserve(ANCHOR_COUNT * 3 + remote_typed_buf.size());
+        for (size_t i = 0; i < ANCHOR_COUNT; ++i) seed.append(ZWS);
+        if (same_field) seed.append(remote_typed_buf);
+
         std::string typed;
-        if (platform::show_system_keyboard("请输入文字", "", typed, false, false)) {
-            if (!typed.empty()) backend->send_text_utf8(typed);
+        if (platform::show_system_keyboard("输入或删除文字 (按退格可删远程已有内容)", seed, typed, false, false)) {
+            // Count how many leading U+200B anchors remain
+            size_t anchors_left = 0;
+            size_t scan = 0;
+            while (scan + 3 <= typed.size() &&
+                   static_cast<uint8_t>(typed[scan]) == 0xE2 &&
+                   static_cast<uint8_t>(typed[scan + 1]) == 0x80 &&
+                   static_cast<uint8_t>(typed[scan + 2]) == 0x8B) {
+                ++anchors_left;
+                scan += 3;
+            }
+            // Strip ALL U+200B anchors anywhere in the returned text
+            std::string clean;
+            clean.reserve(typed.size());
+            for (size_t i = 0; i < typed.size();) {
+                if (i + 3 <= typed.size() &&
+                    static_cast<uint8_t>(typed[i]) == 0xE2 &&
+                    static_cast<uint8_t>(typed[i + 1]) == 0x80 &&
+                    static_cast<uint8_t>(typed[i + 2]) == 0x8B) {
+                    i += 3;
+                } else {
+                    clean.push_back(typed[i++]);
+                }
+            }
+
+            size_t old_chars = same_field ? utf8_codepoint_len(remote_typed_buf) : 0;
+            size_t extra_bs = (anchors_left < ANCHOR_COUNT) ? (ANCHOR_COUNT - anchors_left) : 0;
+            size_t total_bs = old_chars + extra_bs;
+
+            for (size_t i = 0; i < total_bs; ++i) {
+                backend->send_key(42, true, 0);   // HID 42 = Backspace
+                backend->send_key(42, false, 0);
+            }
+            if (!clean.empty()) {
+                backend->send_text_utf8(clean);
+            }
+            remote_typed_buf = clean;
+            remote_typed_nx = nx;
+            remote_typed_ny = ny;
         } else if (!platform::is_switch_hardware()) {
             // Only fall back to built-in OSK on Desktop PCs that have no system keyboard applet!
             // On Switch 2, pressing B / Cancel simply closes the native keyboard cleanly.

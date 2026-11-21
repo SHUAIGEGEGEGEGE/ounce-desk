@@ -317,7 +317,16 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
         backend.send_mouse_button(MouseBtn::RIGHT, b_now || zl_now);
     }
     if (y_now != pad_y_down_) {
-        backend.send_mouse_button(MouseBtn::MIDDLE, y_now);
+        // Y button = Backspace (HID 42) so user can easily delete existing characters in remote inputs!
+        backend.send_key(42, y_now, 0);
+        if (y_now) {
+            pad_y_next_repeat_us_ = platform::now_us() + 420000ULL;
+        }
+    } else if (y_now && platform::now_us() >= pad_y_next_repeat_us_) {
+        // Hold Y to continuously delete characters
+        backend.send_key(42, false, 0);
+        backend.send_key(42, true, 0);
+        pad_y_next_repeat_us_ = platform::now_us() + 75000ULL;
     }
 
     pad_a_down_ = a_now; pad_b_down_ = b_now; pad_y_down_ = y_now;
@@ -339,7 +348,12 @@ void InputMapper::send_shortcut(RemoteBackend& backend, ProtocolType proto, cons
     if (action == "copy") send_combo(backend, primary_mod, primary_mask, 6);
     else if (action == "paste") send_combo(backend, primary_mod, primary_mask, 25);
     else if (action == "undo") send_combo(backend, primary_mod, primary_mask, 29);
-    else if (action == "switch_app") {
+    else if (action == "clear_all") {
+        // Select All (Ctrl+A / Cmd+A) -> Backspace (HID 42)
+        send_combo(backend, primary_mod, primary_mask, 4);
+        backend.send_key(42, true, 0);
+        backend.send_key(42, false, 0);
+    } else if (action == "switch_app") {
         if (is_mac) send_combo(backend, 227, RD_MOD_LMETA, 43);
         else send_combo(backend, 226, RD_MOD_LALT, 43);
     } else if (action == "launcher") {

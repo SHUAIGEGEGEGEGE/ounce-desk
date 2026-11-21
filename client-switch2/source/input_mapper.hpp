@@ -86,6 +86,7 @@ private:
     bool pad_a_down_ = false;
     bool pad_b_down_ = false;
     bool pad_y_down_ = false;
+    uint64_t pad_y_next_repeat_us_ = 0;
     bool pad_zr_down_ = false;
     bool pad_zl_down_ = false;
 

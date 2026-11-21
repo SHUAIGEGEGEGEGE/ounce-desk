@@ -178,12 +178,6 @@ void ProfileManager::add_or_update(const ConnectionProfile& profile, const std::
     bool updated = false;
     for (auto& s : saved_) {
         if (s.host == clean.host && s.port == clean.port && s.protocol == clean.protocol) {
-            if (clean.password.empty() && !s.password.empty()) {
-                clean.password = s.password;
-            }
-            if (clean.username.empty() && !s.username.empty()) {
-                clean.username = s.username;
-            }
             s = clean;
             updated = true;
             break;

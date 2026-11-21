@@ -629,7 +629,7 @@ void UIRenderer::render_perf_hud(int win_w, int /*win_h*/, const BackendStats& s
     char line2[160];
     std::snprintf(line1, sizeof(line1), "%s | %dx%d | %.1f Mbps",
                   st.protocol_label.c_str(), st.fb_width, st.fb_height, st.rx_mbps);
-    std::snprintf(line2, sizeof(line2), "模式: %s | 缩放 %.1fx | [+] 菜单  [X] 输入法",
+    std::snprintf(line2, sizeof(line2), "模式: %s | 缩放 %.1fx | [+] 菜单  [X] 输入法  [Y] 退格",
                   (tmode == TouchMode::TOUCH) ? "触屏" : "鼠标", zoom);
 
     SDL_Rect box{win_w - 640, 14, 624, 62};
@@ -678,17 +678,18 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     // Row 2: OS-Adaptive Shortcuts
     draw_text(panel.x + 32, panel.y + 178, is_mac ? "macOS 常用快捷键:" : "Windows 常用快捷键:", COL_MUTED, 2);
     struct Sc { const char* id; const char* win_lbl; const char* mac_lbl; };
-    const Sc shortcuts[7] = {
+    const Sc shortcuts[8] = {
         {"sc:launcher",   "开始菜单",   "聚焦搜索"},
         {"sc:switch_app", "切换窗口",   "切换应用"},
-        {"sc:copy",       "复制 Ctrl+C","复制 Cmd+C"},
-        {"sc:paste",      "粘贴 Ctrl+V","粘贴 Cmd+V"},
-        {"sc:undo",       "撤销 Ctrl+Z","撤销 Cmd+Z"},
+        {"sc:copy",       "复制",       "复制"},
+        {"sc:paste",      "粘贴",       "粘贴"},
+        {"sc:undo",       "撤销",       "撤销"},
+        {"sc:clear_all",  "清空输入",   "清空输入"},
         {"sc:desktop",    "显示桌面",   "调度中心"},
         {"sc:taskmgr",    "任务管理器", "强制退出"},
     };
-    int sw = (pw - 64 - 6 * 12) / 7;
-    for (int i = 0; i < 7; ++i) {
+    int sw = (pw - 64 - 7 * 12) / 8;
+    for (int i = 0; i < 8; ++i) {
         buttons.push_back({{panel.x + 32 + i * (sw + 12), panel.y + 214, sw, 58},
                            shortcuts[i].id, is_mac ? shortcuts[i].mac_lbl : shortcuts[i].win_lbl, false, false, false});
     }
@@ -722,7 +723,7 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     }
 
     draw_text(panel.x + 32, panel.y + ph - 48,
-              "[+] 打开/关闭菜单  |  [X] 呼出输入法  |  [-] 切换触屏/鼠标模式",
+              "[+] 打开/关闭菜单  |  [X] 呼出输入法  |  [Y] 退格删除  |  [-] 切换触屏/鼠标模式",
               COL_MUTED, 2);
     return buttons;
 }

@@ -117,10 +117,15 @@ bool show_system_keyboard(const std::string& header, const std::string& initial,
             swkbdConfigSetType(&kbd, SwkbdType_NumPad);
             swkbdConfigSetStringLenMax(&kbd, 16);
         } else {
-            swkbdConfigSetType(&kbd, SwkbdType_Normal);
+            // Enable ALL language keyboards (including Simplified/Traditional Chinese Pinyin) + predictive dictionary!
+            swkbdConfigSetType(&kbd, SwkbdType_All);
+            swkbdConfigSetDicFlag(&kbd, 1);
+            swkbdConfigSetReturnButtonFlag(&kbd, 0);
             swkbdConfigSetStringLenMax(&kbd, 256);
         }
     }
+    swkbdConfigSetStringLenMin(&kbd, 0);
+    swkbdConfigSetInitialCursorPos(&kbd, 1);
     swkbdConfigSetHeaderText(&kbd, header.c_str());
     if (!initial.empty()) {
         swkbdConfigSetInitialText(&kbd, initial.c_str());

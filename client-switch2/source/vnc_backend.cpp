@@ -307,7 +307,7 @@ void VncBackend::send_text_utf8(const std::string& utf8) {
     while (pos < utf8.size()) {
         uint32_t cp = keymap::next_utf8_codepoint(utf8.data(), utf8.size(), pos);
         if (cp == 0) break;
-        uint32_t ks = (cp < 0x80) ? cp : (0x01000000u | cp);
+        uint32_t ks = (cp < 0x100) ? cp : (0x01000000u | cp);
         send_keysym(ks, true);
         send_keysym(ks, false);
     }
