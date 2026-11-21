@@ -99,8 +99,21 @@ private:
     void handle_bitmap_update(const uint8_t* data, size_t len);
     void handle_surface_commands(const uint8_t* data, size_t len);
     void blit_bitmap_rect(int left, int top, int width, int height, int bpp, bool compressed,
-                          const uint8_t* data, size_t len);
+                          const uint8_t* data, size_t len, int draw_w, int draw_h);
     void mark_dirty(int x, int y, int w, int h);
+    void handle_pointer_attr(const uint8_t* data, size_t len, int xor_bpp, bool large);
+    void handle_fastpath_update(uint8_t ucode, const uint8_t* data, size_t len, int& frames_win);
+
+    bool bad_codec_logged_ = false;
+    std::vector<uint8_t> fp_frag_buf_;   // Fast-Path fragment reassembly buffer
+    uint8_t fp_frag_code_ = 0;
+    std::vector<uint8_t> ptr_cache_text_;  // pointer cache index -> is I-beam text cursor
+    std::atomic<bool> cursor_text_{false};
+
+public:
+    bool cursor_is_text() const override { return cursor_text_.load(); }
+
+private:
 
     void run_session();
 };

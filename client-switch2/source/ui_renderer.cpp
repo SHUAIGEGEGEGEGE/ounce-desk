@@ -451,6 +451,7 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     const BackendStats& st,
     TouchMode tmode,
     bool show_hud,
+    bool auto_ime,
     int focused_idx) {
 
     std::vector<UIButton> buttons;
@@ -469,16 +470,16 @@ std::vector<UIButton> UIRenderer::render_quick_overlay(
     draw_text(panel.x + 32, panel.y + 22, hdr, COL_TEXT, 3);
 
     // Row 1: Primary Switch 2 Controls (Touch/Mouse Switch + Switch 2 Native Keyboard!)
-    int qw = (pw - 64 - 3 * 16) / 4;
-    buttons.push_back({{panel.x + 32 + 0 * (qw + 16), panel.y + 88, qw, 68}, "act:touch_mode",
+    int qw = (pw - 64 - 4 * 16) / 5;
+    auto q = [&](int i) { return SDL_Rect{panel.x + 32 + i * (qw + 16), panel.y + 88, qw, 68}; };
+    buttons.push_back({q(0), "act:touch_mode",
                        (tmode == TouchMode::TOUCH) ? "当前: 触屏 -> 切为鼠标" : "当前: 鼠标 -> 切为触屏",
                        true, false, false});
-    buttons.push_back({{panel.x + 32 + 1 * (qw + 16), panel.y + 88, qw, 68}, "act:swkbd",
-                       "系统原生输入法 (中文/英文)", false, true, false});
-    buttons.push_back({{panel.x + 32 + 2 * (qw + 16), panel.y + 88, qw, 68}, "act:osk",
-                       "电脑组合键虚拟键盘", false, false, false});
-    buttons.push_back({{panel.x + 32 + 3 * (qw + 16), panel.y + 88, qw, 68}, "act:refresh",
-                       "强制刷新画面", false, false, false});
+    buttons.push_back({q(1), "act:swkbd", "系统原生输入法", false, true, false});
+    buttons.push_back({q(2), "act:auto_ime",
+                       auto_ime ? "点输入框自动弹键盘: 开" : "点输入框自动弹键盘: 关", false, auto_ime, false});
+    buttons.push_back({q(3), "act:osk", "电脑组合键键盘", false, false, false});
+    buttons.push_back({q(4), "act:refresh", "强制刷新画面", false, false, false});
 
     // Row 2: OS-Adaptive Shortcuts
     draw_text(panel.x + 32, panel.y + 178, is_mac ? "macOS 常用快捷键:" : "Windows 常用快捷键:", COL_MUTED, 2);

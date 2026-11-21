@@ -74,6 +74,7 @@ public:
         const BackendStats& st,
         TouchMode tmode,
         bool show_hud,
+        bool auto_ime,
         int focused_idx);
 
     // 6. Built-in PC Special Keys Keyboard (for Ctrl/Alt/Cmd/F-keys/Arrows)

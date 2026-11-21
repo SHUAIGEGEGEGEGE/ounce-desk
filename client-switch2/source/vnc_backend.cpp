@@ -1,6 +1,7 @@
 #include "vnc_backend.hpp"
 
 #include "crypto_utils.hpp"
+#include "cursor_detect.hpp"
 #include "keymap.hpp"
 #include "platform.hpp"
 
@@ -694,14 +695,15 @@ void VncBackend::run_session() {
     spf[16] = 16; // blue-shift
     if (!send_all(spf, sizeof(spf))) { set_error("SetPixelFormat failed"); return; }
 
-    // 6. SetEncodings: ZRLE (16), CopyRect (1), Raw (0), DesktopSize (-223)
-    uint8_t encs[4 + 4 * 4]{};
+    // 6. SetEncodings: ZRLE (16), CopyRect (1), Raw (0), DesktopSize (-223), Cursor (-239)
+    uint8_t encs[4 + 5 * 4]{};
     encs[0] = 2;  // SetEncodings
-    put_be16(encs + 2, 4);
+    put_be16(encs + 2, 5);
     put_be32(encs + 4, 16);                              // ZRLE
     put_be32(encs + 8, 1);                               // CopyRect
     put_be32(encs + 12, 0);                              // Raw
     put_be32(encs + 16, static_cast<uint32_t>(-223));    // DesktopSize
+    put_be32(encs + 20, static_cast<uint32_t>(-239));    // Cursor pseudo-encoding (detect I-beam text cursor)
     if (!send_all(encs, sizeof(encs))) { set_error("SetEncodings failed"); return; }
 
     state_.store(BackendState::STREAMING);
@@ -747,6 +749,23 @@ void VncBackend::run_session() {
                     std::lock_guard<std::mutex> ik(info_mu_);
                     stats_.fb_width = fb_w_;
                     stats_.fb_height = fb_h_;
+                } else if (enc == -239) {
+                    // Cursor pseudo-encoding: rx/ry = hotspot, w*h pixels (4 bytes each) + 1bpp mask
+                    size_t pix_len = static_cast<size_t>(rw) * rh * 4;
+                    size_t mask_stride = static_cast<size_t>((rw + 7) / 8);
+                    size_t mask_len = mask_stride * rh;
+                    std::vector<uint8_t> cbuf(pix_len + mask_len);
+                    if (!cbuf.empty() && !recv_all(cbuf.data(), cbuf.size())) { stop_.store(true); break; }
+                    if (rw > 0 && rh > 0) {
+                        std::vector<uint8_t> vis(static_cast<size_t>(rw) * rh, 0);
+                        const uint8_t* mask = cbuf.data() + pix_len;
+                        for (int y = 0; y < rh; ++y)
+                            for (int x = 0; x < rw; ++x)
+                                vis[static_cast<size_t>(y) * rw + x] = (mask[y * mask_stride + x / 8] >> (7 - (x % 8))) & 1;
+                        cursor_text_.store(cursor_detect::is_ibeam(vis, rw, rh, rx, ry));
+                    } else {
+                        cursor_text_.store(false);
+                    }
                 } else {
                     set_error("Unsupported RFB encoding: " + std::to_string(enc));
                     stop_.store(true);

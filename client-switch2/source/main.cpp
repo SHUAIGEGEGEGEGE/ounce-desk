@@ -101,6 +101,15 @@ int main(int argc, char* argv[]) {
     // Previous frame native Switch 2 touch points for exact DOWN/MOVE/UP synthesis
     std::map<uint32_t, platform::NativeTouchPoint> prev_native_touches;
 
+    // Auto Switch 2 keyboard: tap on a remote text box (cursor turns into I-beam) -> open swkbd;
+    // tap on blank area (normal arrow cursor) -> nothing / cancel.
+    bool auto_ime = true;
+    uint64_t ime_check_at_us = 0;
+    uint64_t tap_down_us = 0;
+    float tap_x0 = 0.0f, tap_y0 = 0.0f;
+    float tap_max_dist = 0.0f;
+    bool tap_tracking = false;
+
     bool running = true;
 
     auto open_new_form = [&](ProtocolType proto) {
@@ -221,6 +230,8 @@ int main(int argc, char* argv[]) {
             show_overlay = false;
         } else if (id == "act:touch_mode") {
             input.toggle_touch_mode();
+        } else if (id == "act:auto_ime") {
+            auto_ime = !auto_ime;
         } else if (id == "act:refresh") {
             backend->request_full_refresh();
             show_overlay = false;
@@ -383,10 +394,21 @@ int main(int argc, char* argv[]) {
                     int tx = static_cast<int>(kv.second.x);
                     int ty = static_cast<int>(kv.second.y);
                     if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
+                        if (cur_map.size() == 1 && prev_native_touches.empty()) {
+                            tap_tracking = true;
+                            tap_down_us = now;
+                            tap_x0 = kv.second.x;
+                            tap_y0 = kv.second.y;
+                            tap_max_dist = 0.0f;
+                        } else {
+                            tap_tracking = false;  // multi-finger gesture: never a text-box tap
+                        }
                         if (UIRenderer::hit_test(menu_pill, tx, ty)) {
+                            tap_tracking = false;
                             show_overlay = true;
                             overlay_focus = 0;
                         } else if (input.on_touch_down(kv.first, kv.second.x, kv.second.y, *backend)) {
+                            tap_tracking = false;
                             show_overlay = true;
                             overlay_focus = 0;
                         }
@@ -395,6 +417,10 @@ int main(int argc, char* argv[]) {
                     }
                 } else if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
                     // Existing finger moved (MOVE)
+                    if (tap_tracking) {
+                        float dx = kv.second.x - tap_x0, dy = kv.second.y - tap_y0;
+                        tap_max_dist = std::max(tap_max_dist, dx * dx + dy * dy);
+                    }
                     input.on_touch_move(kv.first, kv.second.x, kv.second.y, *backend, LOGICAL_W, LOGICAL_H);
                 }
             }
@@ -403,6 +429,13 @@ int main(int argc, char* argv[]) {
                 if (cur_map.find(kv.first) == cur_map.end()) {
                     if (mode == AppMode::STREAMING && backend) {
                         input.on_touch_up(kv.first, *backend);
+                        if (tap_tracking && cur_map.empty()) {
+                            // Short, still, single-finger tap -> check remote cursor shape shortly after click
+                            if (now - tap_down_us < 450000ULL && tap_max_dist < 40.0f * 40.0f) {
+                                ime_check_at_us = now + 320000ULL;
+                            }
+                            tap_tracking = false;
+                        }
                     }
                 }
             }
@@ -564,12 +597,35 @@ int main(int argc, char* argv[]) {
                     if (open_swkbd) {
                         open_streaming_swkbd();
                     }
+                    // Desktop build: left click release also triggers the text-box check
+                    if (!platform::uses_native_touch() && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
+                        ime_check_at_us = platform::now_us() + 320000ULL;
+                    }
+                    // Gamepad A (left click) also triggers the text-box check in mouse mode
+                    if (ev.type == SDL_CONTROLLERBUTTONUP && ev.cbutton.button == SDL_CONTROLLER_BUTTON_A) {
+                        ime_check_at_us = platform::now_us() + 320000ULL;
+                    }
                 }
             }
         }
 
         if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
             input.update_frame(dt, pad, *backend);
+        }
+
+        // Auto-open Switch 2 native keyboard when the tap landed on a remote text input (I-beam cursor)
+        if (ime_check_at_us != 0 && platform::now_us() >= ime_check_at_us) {
+            ime_check_at_us = 0;
+            if (auto_ime && mode == AppMode::STREAMING && backend && !show_overlay && !show_osk &&
+                backend->cursor_is_text()) {
+                platform::log_line("[UI] Tap on remote text field -> opening Switch 2 keyboard");
+                std::string typed;
+                if (platform::show_system_keyboard("请输入文字 (点取消/空白处返回)", "", typed, false, false)) {
+                    if (!typed.empty()) backend->send_text_utf8(typed);
+                }
+                prev_native_touches.clear();
+                last_us = platform::now_us();
+            }
         }
 
         // Render frame in exact 1920x1080 logical space
@@ -609,7 +665,7 @@ int main(int argc, char* argv[]) {
             if (show_hud) ui.render_perf_hud(LOGICAL_W, LOGICAL_H, st, input.touch_mode(), input.viewport().zoom);
             if (show_overlay) {
                 active_buttons = ui.render_quick_overlay(
-                    LOGICAL_W, LOGICAL_H, active_profile, st, input.touch_mode(), show_hud, overlay_focus);
+                    LOGICAL_W, LOGICAL_H, active_profile, st, input.touch_mode(), show_hud, auto_ime, overlay_focus);
             } else if (show_osk) {
                 active_osk = ui.render_osk(LOGICAL_W, LOGICAL_H, active_profile.protocol, osk_sticky_mods, osk_focus);
             }

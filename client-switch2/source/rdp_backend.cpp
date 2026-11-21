@@ -1,6 +1,7 @@
 #include "rdp_backend.hpp"
 
 #include "crypto_utils.hpp"
+#include "cursor_detect.hpp"
 #include "keymap.hpp"
 #include "platform.hpp"
 
@@ -64,193 +65,260 @@ inline uint32_t bgr24_to_rgba(const uint8_t* p) {
     return uint32_t(p[2]) | (uint32_t(p[1]) << 8) | (uint32_t(p[0]) << 16) | 0xFF000000u;
 }
 
-// MS-RDPBCGR Interleaved RLE Bitmap Decompressor (16bpp, 24bpp, 32bpp -> bottom-up RGBA)
-bool decompress_rdp_rle(const uint8_t* src, size_t src_len, int width, int height, int bpp, std::vector<uint32_t>& out_rgba) {
+inline uint32_t rgb555_to_rgba(uint16_t px) {
+    uint8_t r = static_cast<uint8_t>(((px >> 10) & 0x1F) * 255 / 31);
+    uint8_t g = static_cast<uint8_t>(((px >> 5) & 0x1F) * 255 / 31);
+    uint8_t b = static_cast<uint8_t>((px & 0x1F) * 255 / 31);
+    return uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | 0xFF000000u;
+}
+
+// Convert a raw native RDP pixel value (15/16/24bpp, little-endian BGR) to SDL ABGR8888
+inline uint32_t native_to_rgba(uint32_t v, int bpp) {
+    if (bpp == 15) return rgb555_to_rgba(static_cast<uint16_t>(v));
+    if (bpp == 16) return rgb565_to_rgba(static_cast<uint16_t>(v));
+    // 24/32bpp: byte0 = B, byte1 = G, byte2 = R
+    uint8_t b = static_cast<uint8_t>(v & 0xFF);
+    uint8_t g = static_cast<uint8_t>((v >> 8) & 0xFF);
+    uint8_t r = static_cast<uint8_t>((v >> 16) & 0xFF);
+    return uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | 0xFF000000u;
+}
+
+// MS-RDPBCGR 2.2.9.1.1.3.1.2.4 Interleaved RLE Bitmap Decompressor (8/15/16/24bpp).
+// Exact port of FreeRDP's RleDecompress: works on NATIVE pixel values (XOR must be done in native
+// format, NOT after RGBA conversion), output is in stored (bottom-up) row order, width = full
+// TS_BITMAP_DATA width (incl. padding).
+bool decompress_interleaved(const uint8_t* src, size_t src_len, int width, int height, int bpp,
+                            std::vector<uint32_t>& out_rgba) {
     const int bytes_pp = (bpp + 7) / 8;
-    if (bytes_pp < 2 || bytes_pp > 4 || width <= 0 || height <= 0) return false;
-    const size_t total_px = static_cast<size_t>(width) * height;
-    out_rgba.assign(total_px, 0xFF000000u);
+    if (bytes_pp < 1 || bytes_pp > 3 || width <= 0 || height <= 0) return false;
+    const size_t total = static_cast<size_t>(width) * height;
+    std::vector<uint32_t> px(total, 0);
 
-    auto read_pixel = [&](size_t& pos) -> uint32_t {
-        if (pos + bytes_pp > src_len) return 0xFF000000u;
-        uint32_t c = 0xFF000000u;
-        if (bytes_pp == 2) {
-            c = rgb565_to_rgba(le16(src + pos));
-        } else if (bytes_pp == 3) {
-            c = bgr24_to_rgba(src + pos);
-        } else {
-            c = bgr24_to_rgba(src + pos);  // BGRA -> RGBA opaque
-        }
-        pos += bytes_pp;
-        return c;
-    };
-
-    size_t pos = 0;
-    size_t dst = 0;
-    uint32_t fg_pel = 0xFFFFFFFFu;
+    uint32_t white = (bpp == 8) ? 0xFFu : (bpp == 15) ? 0x7FFFu : (bpp == 16) ? 0xFFFFu : 0xFFFFFFu;
+    uint32_t fg = white;
     bool insert_fg = false;
     bool first_line = true;
+    size_t pos = 0;
+    size_t dst = 0;
+    const size_t row = static_cast<size_t>(width);
 
-    auto write_bg = [&](uint32_t count) {
-        for (uint32_t k = 0; k < count && dst < total_px; ++k, ++dst) {
+    auto rd_pix = [&](uint32_t& v) -> bool {
+        if (pos + bytes_pp > src_len) return false;
+        v = src[pos];
+        if (bytes_pp >= 2) v |= uint32_t(src[pos + 1]) << 8;
+        if (bytes_pp >= 3) v |= uint32_t(src[pos + 2]) << 16;
+        pos += bytes_pp;
+        return true;
+    };
+    auto put = [&](uint32_t v) {
+        if (dst < total) px[dst] = v;
+        ++dst;
+    };
+    auto above = [&]() -> uint32_t { return (dst >= row && dst - row < total) ? px[dst - row] : 0u; };
+    auto fgbg = [&](uint8_t mask, uint32_t nbits) {
+        for (uint32_t b = 0; b < nbits; ++b) {
+            bool set = (mask >> b) & 1u;
+            if (first_line) put(set ? fg : 0u);
+            else { uint32_t a = above(); put(set ? (a ^ fg) : a); }
+        }
+    };
+
+    while (pos < src_len && dst < total) {
+        if (first_line && dst >= row) {
+            first_line = false;
+            insert_fg = false;
+        }
+        uint8_t hdr = src[pos];
+        uint32_t code;
+        if ((hdr & 0xC0u) != 0xC0u) code = hdr >> 5;          // REGULAR
+        else if ((hdr & 0xF0u) == 0xF0u) code = hdr;          // MEGA_MEGA / SPECIAL
+        else code = hdr >> 4;                                 // LITE
+
+        uint32_t run = 0;
+        // ---- run-length extraction ----
+        auto run_regular = [&]() -> bool {
+            run = hdr & 0x1Fu;
+            if (run == 0) { if (pos + 1 >= src_len) return false; run = src[pos + 1] + 32u; pos += 2; }
+            else pos += 1;
+            return true;
+        };
+        auto run_regular_fgbg = [&]() -> bool {
+            run = hdr & 0x1Fu;
+            if (run == 0) { if (pos + 1 >= src_len) return false; run = src[pos + 1] + 1u; pos += 2; }
+            else { run *= 8u; pos += 1; }
+            return true;
+        };
+        auto run_lite = [&]() -> bool {
+            run = hdr & 0x0Fu;
+            if (run == 0) { if (pos + 1 >= src_len) return false; run = src[pos + 1] + 16u; pos += 2; }
+            else pos += 1;
+            return true;
+        };
+        auto run_lite_fgbg = [&]() -> bool {
+            run = hdr & 0x0Fu;
+            if (run == 0) { if (pos + 1 >= src_len) return false; run = src[pos + 1] + 1u; pos += 2; }
+            else { run *= 8u; pos += 1; }
+            return true;
+        };
+        auto run_mega = [&]() -> bool {
+            if (pos + 2 >= src_len) return false;
+            run = uint32_t(src[pos + 1]) | (uint32_t(src[pos + 2]) << 8);
+            pos += 3;
+            return true;
+        };
+
+        if (code == 0x00 || code == 0xF0) {
+            // Background run
+            if (!(code == 0x00 ? run_regular() : run_mega())) break;
             if (first_line) {
-                out_rgba[dst] = 0xFF000000u;
+                if (insert_fg && run > 0) { put(fg); --run; }
+                while (run-- > 0) put(0u);
             } else {
-                out_rgba[dst] = out_rgba[dst - width];
+                if (insert_fg && run > 0) { put(above() ^ fg); --run; }
+                while (run-- > 0) put(above());
             }
-            if (static_cast<int>(dst % width) == width - 1) first_line = false;
-        }
-    };
-
-    auto write_fg_xor = [&](uint32_t count, uint32_t fg) {
-        for (uint32_t k = 0; k < count && dst < total_px; ++k, ++dst) {
-            if (first_line) {
-                out_rgba[dst] = fg | 0xFF000000u;
-            } else {
-                out_rgba[dst] = ((out_rgba[dst - width] ^ fg) | 0xFF000000u);
-            }
-            if (static_cast<int>(dst % width) == width - 1) first_line = false;
-        }
-    };
-
-    auto write_mask_byte = [&](uint8_t mask, uint32_t fg) {
-        for (int bit = 0; bit < 8 && dst < total_px; ++bit, ++dst) {
-            bool set = (mask & (1u << bit)) != 0;
-            uint32_t prev = first_line ? 0xFF000000u : out_rgba[dst - width];
-            out_rgba[dst] = set ? ((prev ^ fg) | 0xFF000000u) : prev;
-            if (static_cast<int>(dst % width) == width - 1) first_line = false;
-        }
-    };
-
-    while (pos < src_len && dst < total_px) {
-        uint8_t hdr = src[pos++];
-        uint8_t code = hdr >> 5;
-        uint32_t run = hdr & 0x1Fu;
-
-        if (code == 0) {
-            // REGULAR_BG_RUN
-            if (run == 0 && pos < src_len) run = src[pos++] + 32;
-            if (insert_fg && run > 0) {
-                write_fg_xor(1, fg_pel);
-                --run;
-            }
-            write_bg(run);
             insert_fg = true;
             continue;
         }
         insert_fg = false;
 
-        if (code == 1) {
-            // REGULAR_FG_RUN
-            if (run == 0 && pos < src_len) run = src[pos++] + 32;
-            write_fg_xor(run, fg_pel);
-        } else if (code == 2) {
-            // REGULAR_FGBG_IMAGE
-            uint32_t nbytes = (run == 0 && pos < src_len) ? (src[pos++] + 1u) : (run * 8u);
-            for (uint32_t i = 0; i < nbytes && pos < src_len && dst < total_px; ++i) {
-                write_mask_byte(src[pos++], fg_pel);
+        switch (code) {
+            case 0x01: case 0xF1: case 0x0C: case 0xF6: {
+                bool ok = (code == 0x01) ? run_regular() : (code == 0x0C) ? run_lite() : run_mega();
+                if (!ok) return true;
+                if (code == 0x0C || code == 0xF6) { if (!rd_pix(fg)) return true; }
+                if (first_line) { while (run-- > 0) put(fg); }
+                else { while (run-- > 0) put(above() ^ fg); }
+                break;
             }
-        } else if (code == 3) {
-            // REGULAR_COLOR_RUN
-            if (run == 0 && pos < src_len) run = src[pos++] + 32;
-            uint32_t c = read_pixel(pos);
-            for (uint32_t k = 0; k < run && dst < total_px; ++k, ++dst) {
-                out_rgba[dst] = c;
-                if (static_cast<int>(dst % width) == width - 1) first_line = false;
+            case 0x0E: case 0xF8: {
+                bool ok = (code == 0x0E) ? run_lite() : run_mega();
+                if (!ok) return true;
+                uint32_t a = 0, b = 0;
+                if (!rd_pix(a) || !rd_pix(b)) return true;
+                while (run-- > 0) { put(a); put(b); }
+                break;
             }
-        } else if (code == 4) {
-            // REGULAR_COLOR_IMAGE
-            if (run == 0 && pos < src_len) run = src[pos++] + 32;
-            for (uint32_t k = 0; k < run && dst < total_px; ++k, ++dst) {
-                out_rgba[dst] = read_pixel(pos);
-                if (static_cast<int>(dst % width) == width - 1) first_line = false;
+            case 0x03: case 0xF3: {
+                bool ok = (code == 0x03) ? run_regular() : run_mega();
+                if (!ok) return true;
+                uint32_t a = 0;
+                if (!rd_pix(a)) return true;
+                while (run-- > 0) put(a);
+                break;
             }
-        } else if (code == 6) {
-            // LITE_SET_FG_FG_RUN (0xC0..0xCF) or LITE_SET_FG_FGBG_IMAGE (0xD0..0xDF)
-            uint8_t sub = hdr >> 4;
-            run = hdr & 0x0Fu;
-            if (sub == 0x0C) {
-                if (run == 0 && pos < src_len) run = src[pos++] + 16;
-                fg_pel = read_pixel(pos);
-                write_fg_xor(run, fg_pel);
-            } else {
-                uint32_t nbytes = (run == 0 && pos < src_len) ? (src[pos++] + 1u) : (run * 8u);
-                fg_pel = read_pixel(pos);
-                for (uint32_t i = 0; i < nbytes && pos < src_len && dst < total_px; ++i) {
-                    write_mask_byte(src[pos++], fg_pel);
+            case 0x02: case 0xF2: case 0x0D: case 0xF7: {
+                bool ok = (code == 0x02) ? run_regular_fgbg() : (code == 0x0D) ? run_lite_fgbg() : run_mega();
+                if (!ok) return true;
+                if (code == 0x0D || code == 0xF7) { if (!rd_pix(fg)) return true; }
+                while (run > 8) {
+                    if (pos >= src_len) return true;
+                    fgbg(src[pos++], 8);
+                    run -= 8;
                 }
+                if (run > 0) {
+                    if (pos >= src_len) return true;
+                    fgbg(src[pos++], run);
+                }
+                break;
             }
-        } else if (code == 7) {
-            // Extended / Mega / Special orders
-            uint8_t sub = hdr >> 4;
-            if (sub == 0x0E) {
-                // LITE_DITHERED_RUN
-                run = hdr & 0x0Fu;
-                if (run == 0 && pos < src_len) run = src[pos++] + 16;
-                uint32_t c1 = read_pixel(pos);
-                uint32_t c2 = read_pixel(pos);
-                for (uint32_t k = 0; k < run && dst < total_px; ++k) {
-                    out_rgba[dst++] = c1;
-                    if (static_cast<int>((dst - 1) % width) == width - 1) first_line = false;
-                    if (dst < total_px) {
-                        out_rgba[dst++] = c2;
-                        if (static_cast<int>((dst - 1) % width) == width - 1) first_line = false;
+            case 0x04: case 0xF4: {
+                bool ok = (code == 0x04) ? run_regular() : run_mega();
+                if (!ok) return true;
+                while (run-- > 0) {
+                    uint32_t a = 0;
+                    if (!rd_pix(a)) return true;
+                    put(a);
+                }
+                break;
+            }
+            case 0xF9: pos += 1; fgbg(0x03, 8); break;   // SPECIAL_FGBG_1
+            case 0xFA: pos += 1; fgbg(0x05, 8); break;   // SPECIAL_FGBG_2
+            case 0xFD: pos += 1; put(white); break;      // WHITE
+            case 0xFE: pos += 1; put(0u); break;         // BLACK
+            default:
+                return true;  // invalid order: stop decoding, keep what we have
+        }
+    }
+
+    out_rgba.resize(total);
+    for (size_t i = 0; i < total; ++i) out_rgba[i] = native_to_rgba(px[i], bpp);
+    return true;
+}
+
+// MS-RDPEGDI 2.2.2.5.1 RDP 6.0 Planar Bitmap Codec (used by Windows for compressed 32bpp bitmaps).
+// Output in stored (bottom-up) row order like interleaved.
+bool decompress_planar(const uint8_t* src, size_t src_len, int width, int height,
+                       std::vector<uint32_t>& out_rgba) {
+    if (src_len < 1 || width <= 0 || height <= 0) return false;
+    const uint8_t hdr = src[0];
+    const int cll = hdr & 0x07;
+    const bool cs = (hdr & 0x08) != 0;
+    const bool rle = (hdr & 0x10) != 0;
+    const bool no_alpha = (hdr & 0x20) != 0;
+    if (cll != 0 || cs) return false;  // YCoCg / chroma subsampling not negotiated by us
+
+    const size_t plane_sz = static_cast<size_t>(width) * height;
+    std::vector<uint8_t> planes[4];  // A, R, G, B
+    for (auto& p : planes) p.assign(plane_sz, 0);
+    size_t pos = 1;
+
+    auto decode_rle_plane = [&](std::vector<uint8_t>& out) -> bool {
+        for (int y = 0; y < height; ++y) {
+            uint8_t* cur = out.data() + static_cast<size_t>(y) * width;
+            const uint8_t* prev = (y > 0) ? cur - width : nullptr;
+            int x = 0;
+            int pixel = 0;
+            while (x < width) {
+                if (pos >= src_len) return false;
+                uint8_t ctrl = src[pos++];
+                int n_run = ctrl & 0x0F;
+                int n_raw = (ctrl >> 4) & 0x0F;
+                if (n_run == 1) { n_run = n_raw + 16; n_raw = 0; }
+                else if (n_run == 2) { n_run = n_raw + 32; n_raw = 0; }
+                if (pos + static_cast<size_t>(n_raw) > src_len) return false;
+                if (!prev) {
+                    while (n_raw-- > 0) {
+                        pixel = src[pos++];
+                        if (x < width) cur[x] = static_cast<uint8_t>(pixel);
+                        ++x;
+                    }
+                    while (n_run-- > 0) {
+                        if (x < width) cur[x] = static_cast<uint8_t>(pixel);
+                        ++x;
+                    }
+                } else {
+                    while (n_raw-- > 0) {
+                        int d = src[pos++];
+                        pixel = (d & 1) ? -((d >> 1) + 1) : (d >> 1);
+                        if (x < width) cur[x] = static_cast<uint8_t>(prev[x] + pixel);
+                        ++x;
+                    }
+                    while (n_run-- > 0) {
+                        if (x < width) cur[x] = static_cast<uint8_t>(prev[x] + pixel);
+                        ++x;
                     }
                 }
-            } else if (hdr == 0xF0 && pos + 2 <= src_len) {
-                run = le16(src + pos); pos += 2;
-                write_bg(run);
-            } else if (hdr == 0xF1 && pos + 2 <= src_len) {
-                run = le16(src + pos); pos += 2;
-                write_fg_xor(run, fg_pel);
-            } else if (hdr == 0xF2 && pos + 2 <= src_len) {
-                uint32_t nbytes = le16(src + pos); pos += 2;
-                for (uint32_t i = 0; i < nbytes && pos < src_len && dst < total_px; ++i) write_mask_byte(src[pos++], fg_pel);
-            } else if (hdr == 0xF3 && pos + 2 <= src_len) {
-                run = le16(src + pos); pos += 2;
-                uint32_t c = read_pixel(pos);
-                for (uint32_t k = 0; k < run && dst < total_px; ++k, ++dst) {
-                    out_rgba[dst] = c;
-                    if (static_cast<int>(dst % width) == width - 1) first_line = false;
-                }
-            } else if (hdr == 0xF4 && pos + 2 <= src_len) {
-                run = le16(src + pos); pos += 2;
-                for (uint32_t k = 0; k < run && dst < total_px; ++k, ++dst) {
-                    out_rgba[dst] = read_pixel(pos);
-                    if (static_cast<int>(dst % width) == width - 1) first_line = false;
-                }
-            } else if (hdr == 0xF6 && pos + 2 <= src_len) {
-                run = le16(src + pos); pos += 2;
-                fg_pel = read_pixel(pos);
-                write_fg_xor(run, fg_pel);
-            } else if (hdr == 0xF7 && pos + 2 <= src_len) {
-                uint32_t nbytes = le16(src + pos); pos += 2;
-                fg_pel = read_pixel(pos);
-                for (uint32_t i = 0; i < nbytes && pos < src_len && dst < total_px; ++i) write_mask_byte(src[pos++], fg_pel);
-            } else if (hdr == 0xF8 && pos + 2 <= src_len) {
-                run = le16(src + pos); pos += 2;
-                uint32_t c1 = read_pixel(pos);
-                uint32_t c2 = read_pixel(pos);
-                for (uint32_t k = 0; k < run && dst < total_px; ++k) {
-                    out_rgba[dst++] = c1;
-                    if (static_cast<int>((dst - 1) % width) == width - 1) first_line = false;
-                    if (dst < total_px) {
-                        out_rgba[dst++] = c2;
-                        if (static_cast<int>((dst - 1) % width) == width - 1) first_line = false;
-                    }
-                }
-            } else if (hdr == 0xF9) {
-                write_mask_byte(0x03, fg_pel);
-            } else if (hdr == 0xFA) {
-                write_mask_byte(0x05, fg_pel);
-            } else if (hdr == 0xFD) {
-                out_rgba[dst++] = 0xFFFFFFFFu;
-                if (static_cast<int>((dst - 1) % width) == width - 1) first_line = false;
-            } else if (hdr == 0xFE) {
-                out_rgba[dst++] = 0xFF000000u;
-                if (static_cast<int>((dst - 1) % width) == width - 1) first_line = false;
             }
         }
+        return true;
+    };
+
+    const int first = no_alpha ? 1 : 0;
+    for (int p = first; p < 4; ++p) {
+        if (rle) {
+            if (!decode_rle_plane(planes[p])) break;
+        } else {
+            if (pos + plane_sz > src_len) break;
+            std::memcpy(planes[p].data(), src + pos, plane_sz);
+            pos += plane_sz;
+        }
+    }
+
+    out_rgba.resize(plane_sz);
+    for (size_t i = 0; i < plane_sz; ++i) {
+        out_rgba[i] = uint32_t(planes[1][i]) | (uint32_t(planes[2][i]) << 8) |
+                      (uint32_t(planes[3][i]) << 16) | 0xFF000000u;
     }
     return true;
 }
@@ -1062,6 +1130,8 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
 
     // Parse server Demand Active capability sets to echo preferredBitsPerPixel
     uint16_t server_bpp = 32;
+    uint16_t srv_w = profile_.req_width;
+    uint16_t srv_h = profile_.req_height;
     uint16_t cb_src_desc = le16(pdu + 10);
     uint16_t cb_combined_caps = le16(pdu + 12);
     size_t caps_off = 14 + static_cast<size_t>(cb_src_desc);
@@ -1076,6 +1146,12 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
                 uint16_t bpp = le16(pdu + cpos + 4);
                 if (bpp == 15 || bpp == 16 || bpp == 24 || bpp == 32) {
                     server_bpp = bpp;
+                }
+                uint16_t sw = le16(pdu + cpos + 12);
+                uint16_t sh = le16(pdu + cpos + 14);
+                if (sw >= 200 && sh >= 200 && sw <= 8192 && sh <= 8192) {
+                    srv_w = sw;
+                    srv_h = sh;
                 }
             }
             cpos += clen;
@@ -1124,8 +1200,8 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
         push_le16(c, 1);                    // receive1BitPerPixel
         push_le16(c, 1);                    // receive4BitsPerPixel
         push_le16(c, 1);                    // receive8BitsPerPixel
-        push_le16(c, profile_.req_width);   // desktopWidth
-        push_le16(c, profile_.req_height);  // desktopHeight
+        push_le16(c, srv_w);               // desktopWidth (echo server)
+        push_le16(c, srv_h);               // desktopHeight (echo server)
         push_le16(c, 0);                    // pad2octets
         push_le16(c, 1);                    // desktopResizeFlag = TRUE
         push_le16(c, 1);                    // bitmapCompressionFlag = TRUE (RLE)
@@ -1290,12 +1366,17 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
 
     {
         std::lock_guard<std::mutex> lk(fb_mu_);
-        fb_w_ = profile_.req_width;
-        fb_h_ = profile_.req_height;
+        fb_w_ = srv_w;
+        fb_h_ = srv_h;
         if (static_cast<int>(fb_rgba_.size()) != fb_w_ * fb_h_) {
             fb_rgba_.assign(static_cast<size_t>(fb_w_) * fb_h_, 0xFF0A0E18u);
         }
         full_dirty_ = true;
+    }
+    {
+        std::lock_guard<std::mutex> ik(info_mu_);
+        stats_.fb_width = srv_w;
+        stats_.fb_height = srv_h;
     }
     state_.store(BackendState::STREAMING);
     set_status("已连接 Windows 远程桌面 " + profile_.host);
@@ -1313,37 +1394,145 @@ void RdpBackend::mark_dirty(int x, int y, int w, int h) {
 }
 
 void RdpBackend::blit_bitmap_rect(int left, int top, int width, int height, int bpp, bool compressed,
-                                  const uint8_t* data, size_t len) {
+                                  const uint8_t* data, size_t len, int draw_w, int draw_h) {
     if (width <= 0 || height <= 0 || !data || len == 0) return;
+    if (draw_w <= 0 || draw_w > width) draw_w = width;
+    if (draw_h <= 0 || draw_h > height) draw_h = height;
     std::vector<uint32_t> pixels;
 
+    // Decode the FULL stored bitmap (width x height incl. padding columns), in stored bottom-up order
     if (compressed) {
-        if (!decompress_rdp_rle(data, len, width, height, bpp, pixels)) return;
+        bool ok = (bpp == 32) ? decompress_planar(data, len, width, height, pixels)
+                              : decompress_interleaved(data, len, width, height, bpp, pixels);
+        if (!ok) {
+            if (!bad_codec_logged_) {
+                bad_codec_logged_ = true;
+                platform::log_line("[RDP] Unsupported compressed bitmap bpp=" + std::to_string(bpp) +
+                                   " hdr=" + std::to_string(len ? data[0] : 0));
+            }
+            return;
+        }
     } else {
         int bytes_pp = (bpp + 7) / 8;
         if (bytes_pp < 2 || bytes_pp > 4) return;
+        // Uncompressed scanlines are padded to a 4-byte boundary
+        size_t stride = (static_cast<size_t>(width) * bytes_pp + 3) & ~static_cast<size_t>(3);
         pixels.assign(static_cast<size_t>(width) * height, 0xFF000000u);
-        size_t pos = 0;
-        for (size_t i = 0; i < pixels.size() && pos + bytes_pp <= len; ++i) {
-            if (bytes_pp == 2) pixels[i] = rgb565_to_rgba(le16(data + pos));
-            else pixels[i] = bgr24_to_rgba(data + pos);
-            pos += bytes_pp;
+        for (int y = 0; y < height; ++y) {
+            size_t rp = static_cast<size_t>(y) * stride;
+            for (int x = 0; x < width; ++x) {
+                size_t pp = rp + static_cast<size_t>(x) * bytes_pp;
+                if (pp + bytes_pp > len) break;
+                uint32_t v = (bytes_pp == 2) ? le16(data + pp)
+                                             : (uint32_t(data[pp]) | (uint32_t(data[pp + 1]) << 8) | (uint32_t(data[pp + 2]) << 16));
+                pixels[static_cast<size_t>(y) * width + x] = native_to_rgba(v, bpp);
+            }
         }
     }
 
-    // RDP bitmaps are stored bottom-up -> flip vertically into framebuffer
+    // RDP bitmaps are stored bottom-up -> flip vertically, and only copy the visible draw_w x draw_h area
     std::lock_guard<std::mutex> lk(fb_mu_);
     for (int y = 0; y < height; ++y) {
-        int dst_y = top + (height - 1 - y);
+        int row_from_top = height - 1 - y;
+        if (row_from_top >= draw_h) continue;
+        int dst_y = top + row_from_top;
         if (dst_y < 0 || dst_y >= fb_h_) continue;
-        int copy_w = std::min(width, fb_w_ - left);
+        int copy_w = std::min(draw_w, fb_w_ - left);
         if (copy_w > 0 && left >= 0) {
             std::memcpy(fb_rgba_.data() + static_cast<size_t>(dst_y) * fb_w_ + left,
                         pixels.data() + static_cast<size_t>(y) * width,
                         static_cast<size_t>(copy_w) * 4);
         }
     }
-    mark_dirty(left, top, width, height);
+    mark_dirty(left, top, draw_w, draw_h);
+}
+
+void RdpBackend::handle_pointer_attr(const uint8_t* data, size_t len, int xor_bpp, bool large) {
+    size_t hdr = large ? 18 : 14;
+    if (len < hdr) return;
+    uint16_t cache_idx = le16(data + 0);
+    int hx = le16(data + 2);
+    int hy = le16(data + 4);
+    int w  = le16(data + 6);
+    int h  = le16(data + 8);
+    uint32_t and_len = large ? le32(data + 10) : le16(data + 10);
+    uint32_t xor_len = large ? le32(data + 14) : le16(data + 12);
+    if (w <= 0 || h <= 0 || w > 384 || h > 384) return;
+    if (hdr + xor_len + and_len > len) return;
+    const uint8_t* xor_d = data + hdr;
+    const uint8_t* and_d = xor_d + xor_len;
+
+    size_t xor_stride = ((static_cast<size_t>(w) * xor_bpp + 7) / 8 + 1) & ~static_cast<size_t>(1);
+    size_t and_stride = ((static_cast<size_t>(w) + 7) / 8 + 1) & ~static_cast<size_t>(1);
+    bool has_and = and_len >= and_stride * h;
+    bool has_xor = xor_len >= xor_stride * h;
+
+    // For 32bpp cursors with real alpha, alpha defines visibility
+    bool use_alpha = false;
+    if (xor_bpp == 32 && has_xor) {
+        for (int y = 0; y < h && !use_alpha; ++y)
+            for (int x = 0; x < w; ++x)
+                if (xor_d[y * xor_stride + x * 4 + 3] != 0) { use_alpha = true; break; }
+    }
+
+    std::vector<uint8_t> vis(static_cast<size_t>(w) * h, 0);
+    for (int y = 0; y < h; ++y) {
+        int sy = h - 1 - y;  // masks are stored bottom-up
+        for (int x = 0; x < w; ++x) {
+            bool and_bit = has_and ? ((and_d[sy * and_stride + x / 8] >> (7 - (x % 8))) & 1) != 0 : false;
+            bool xor_nz = false;
+            uint8_t alpha = 0;
+            if (has_xor) {
+                const uint8_t* xr = xor_d + sy * xor_stride;
+                if (xor_bpp == 1) xor_nz = ((xr[x / 8] >> (7 - (x % 8))) & 1) != 0;
+                else {
+                    int bpp_b = (xor_bpp + 7) / 8;
+                    for (int k = 0; k < std::min(bpp_b, 3); ++k) if (xr[x * bpp_b + k]) xor_nz = true;
+                    if (xor_bpp == 32) alpha = xr[x * 4 + 3];
+                }
+            }
+            bool v = use_alpha ? (alpha != 0 || (and_bit && xor_nz)) : (!and_bit || xor_nz);
+            vis[static_cast<size_t>(y) * w + x] = v ? 1 : 0;
+        }
+    }
+    bool text = cursor_detect::is_ibeam(vis, w, h, hx, hy);
+    if (cache_idx >= ptr_cache_text_.size()) ptr_cache_text_.resize(cache_idx + 1, 0);
+    ptr_cache_text_[cache_idx] = text ? 1 : 0;
+    cursor_text_.store(text);
+}
+
+void RdpBackend::handle_fastpath_update(uint8_t ucode, const uint8_t* data, size_t len, int& frames_win) {
+    switch (ucode) {
+        case 0x01:  // FASTPATH_UPDATETYPE_BITMAP
+            handle_bitmap_update(data, len);
+            ++frames_win;
+            break;
+        case 0x04:  // FASTPATH_UPDATETYPE_SURFCMDS
+            handle_surface_commands(data, len);
+            ++frames_win;
+            break;
+        case 0x05:  // PTR_NULL (hidden)
+        case 0x06:  // PTR_DEFAULT (arrow)
+            cursor_text_.store(false);
+            break;
+        case 0x09:  // FASTPATH_UPDATETYPE_COLOR (24bpp TS_COLORPOINTERATTRIBUTE)
+            handle_pointer_attr(data, len, 24, false);
+            break;
+        case 0x0A:  // FASTPATH_UPDATETYPE_CACHED
+            if (len >= 2) {
+                uint16_t idx = le16(data);
+                cursor_text_.store(idx < ptr_cache_text_.size() && ptr_cache_text_[idx] != 0);
+            }
+            break;
+        case 0x0B:  // FASTPATH_UPDATETYPE_POINTER (xorBpp + TS_COLORPOINTERATTRIBUTE)
+            if (len >= 2) handle_pointer_attr(data + 2, len - 2, le16(data), false);
+            break;
+        case 0x0C:  // FASTPATH_UPDATETYPE_LARGE_POINTER
+            if (len >= 2) handle_pointer_attr(data + 2, len - 2, le16(data), true);
+            break;
+        default:
+            break;
+    }
 }
 
 void RdpBackend::handle_bitmap_update(const uint8_t* data, size_t len) {
@@ -1373,7 +1562,8 @@ void RdpBackend::handle_bitmap_update(const uint8_t* data, size_t len) {
         }
         int draw_w = std::min(w, right - left + 1);
         int draw_h = std::min(h, bottom - top + 1);
-        blit_bitmap_rect(left, top, draw_w > 0 ? draw_w : w, draw_h > 0 ? draw_h : h, bpp, compressed, bdata, bsize);
+        // Decode using the full stored width/height (w x h); only draw the destination rectangle
+        blit_bitmap_rect(left, top, w, h, bpp, compressed, bdata, bsize, draw_w, draw_h);
         pos += blen;
     }
 }
@@ -1395,7 +1585,7 @@ void RdpBackend::handle_surface_commands(const uint8_t* data, size_t len) {
             pos += 20;
             if (pos + blen > len) break;
             if (codec_id == 0) {
-                blit_bitmap_rect(left, top, w, h, bpp, false, data + pos, blen);
+                blit_bitmap_rect(left, top, w, h, bpp, false, data + pos, blen, w, h);
             }
             pos += blen;
         } else if (cmd == 0x0006) {  // FRAME_MARKER
@@ -1711,16 +1901,25 @@ void RdpBackend::run_session() {
                 pos += 2;
                 if (pos + usize > fp.size()) break;
 
-                // Only decode un-compressed (comp_flags == 0) single/reassembled updates
-                if ((comp_flags & 0x20) == 0 && (frag == 0)) {
-                    if (ucode == 0x01) {
-                        // FASTPATH_UPDATETYPE_BITMAP
-                        handle_bitmap_update(fp.data() + pos, usize);
-                        ++frames_win;
-                    } else if (ucode == 0x04) {
-                        // FASTPATH_UPDATETYPE_SURFCMDS
-                        handle_surface_commands(fp.data() + pos, usize);
-                        ++frames_win;
+                // Only decode un-compressed updates (we never negotiate bulk compression)
+                if ((comp_flags & 0x20) == 0) {
+                    const uint8_t* ud = fp.data() + pos;
+                    if (frag == 0) {
+                        // FASTPATH_FRAGMENT_SINGLE
+                        handle_fastpath_update(ucode, ud, usize, frames_win);
+                    } else if (frag == 2) {
+                        // FASTPATH_FRAGMENT_FIRST
+                        fp_frag_buf_.assign(ud, ud + usize);
+                        fp_frag_code_ = ucode;
+                    } else {
+                        // NEXT (3) / LAST (1)
+                        if (!fp_frag_buf_.empty() && fp_frag_code_ == ucode) {
+                            fp_frag_buf_.insert(fp_frag_buf_.end(), ud, ud + usize);
+                            if (frag == 1) {
+                                handle_fastpath_update(ucode, fp_frag_buf_.data(), fp_frag_buf_.size(), frames_win);
+                                fp_frag_buf_.clear();
+                            }
+                        }
                     }
                 }
                 pos += usize;

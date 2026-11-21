@@ -89,4 +89,8 @@ public:
     virtual void send_key(uint16_t hid_usage, bool pressed, uint8_t modifiers) = 0;
     virtual void send_text_utf8(const std::string& utf8) = 0;
     virtual void request_full_refresh() = 0;
+
+    // True when the remote mouse cursor is currently an I-beam text cursor (hovering a text input field).
+    // Used to auto-open the Switch 2 native keyboard when the user taps a remote text box.
+    virtual bool cursor_is_text() const { return false; }
 };
