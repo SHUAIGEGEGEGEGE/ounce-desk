@@ -1,0 +1,10 @@
+client-switch2/build/
+client-switch2/build-win/
+client-switch2/build-desktop/
+client-switch2/*.elf
+client-switch2/*.nacp
+client-switch2/*.map
+tests/*.exe
+__pycache__/
+*.pyc
+config/

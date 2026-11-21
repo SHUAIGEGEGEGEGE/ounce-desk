@@ -1,0 +1,39 @@
+name: Build OunceDesk (Switch 2 kaiHEN .nro + Verification)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify-desktop-compile:
+    name: Verify C++17 Compile (Linux Desktop) & Protocol Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SDL2, mbedTLS, zlib
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libsdl2-dev libmbedtls-dev zlib1g-dev
+      - name: Build Desktop C++17 Target
+        working-directory: client-switch2
+        run: cmake -S . -B build-desktop && cmake --build build-desktop -j$(nproc)
+      - name: Run Protocol & Static Audit Tests
+        run: python3 -m unittest discover -s tests -v
+
+  build-switch2-nro:
+    name: Build Switch 2 kaiHEN (OunceDesk.nro)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ounce-devkit container
+        working-directory: client-switch2
+        run: docker build -t ouncedesk-switch2-builder .
+      - name: Compile OunceDesk.nro
+        working-directory: client-switch2
+        run: docker run --rm -v "$PWD:/src" -w /src ouncedesk-switch2-builder make -j$(nproc)
+      - name: Upload OunceDesk.nro artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OunceDesk-Switch2-kaiHEN
+          path: client-switch2/OunceDesk.nro
