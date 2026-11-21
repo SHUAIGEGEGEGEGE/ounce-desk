@@ -123,27 +123,32 @@ void ProfileManager::load(const std::string& path) {
     if (!in.is_open()) return;
     std::string line;
     while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
+        std::vector<std::string> fields;
         std::stringstream ss(line);
-        std::string proto_s, name, host, port_s, user, dom, ws, hs;
-        if (std::getline(ss, proto_s, '|') &&
-            std::getline(ss, name, '|') &&
-            std::getline(ss, host, '|') &&
-            std::getline(ss, port_s, '|') &&
-            std::getline(ss, user, '|') &&
-            std::getline(ss, dom, '|') &&
-            std::getline(ss, ws, '|') &&
-            std::getline(ss, hs)) {
+        std::string item;
+        while (std::getline(ss, item, '|')) {
+            fields.push_back(item);
+        }
+        // Keep trailing empty field if line ended with '|'
+        if (!line.empty() && line.back() == '|') {
+            fields.push_back("");
+        }
+        if (fields.size() >= 8) {
             ConnectionProfile p;
-            p.protocol = (proto_s == "VNC") ? ProtocolType::VNC_MACOS : ProtocolType::RDP_WINDOWS;
-            p.name = name;
-            p.host = host;
-            p.port = static_cast<uint16_t>(std::atoi(port_s.c_str()));
+            p.protocol = (fields[0] == "VNC") ? ProtocolType::VNC_MACOS : ProtocolType::RDP_WINDOWS;
+            p.name = fields[1];
+            p.host = fields[2];
+            p.port = static_cast<uint16_t>(std::atoi(fields[3].c_str()));
             if (p.port == 0) p.port = (p.protocol == ProtocolType::VNC_MACOS) ? 5900 : 3389;
-            p.username = user;
-            p.domain = dom;
-            p.req_width = static_cast<uint16_t>(std::max(640, std::atoi(ws.c_str())));
-            p.req_height = static_cast<uint16_t>(std::max(480, std::atoi(hs.c_str())));
+            p.username = fields[4];
+            p.domain = fields[5];
+            p.req_width = static_cast<uint16_t>(std::max(640, std::atoi(fields[6].c_str())));
+            p.req_height = static_cast<uint16_t>(std::max(480, std::atoi(fields[7].c_str())));
+            if (fields.size() >= 9) {
+                p.password = fields[8];
+            }
             p.from_mdns = false;
             saved_.push_back(p);
         }
@@ -153,12 +158,13 @@ void ProfileManager::load(const std::string& path) {
 void ProfileManager::save(const std::string& path) const {
     std::ofstream out(path, std::ios::trunc);
     if (!out.is_open()) return;
-    out << "# OunceDesk connections (proto|name|host|port|user|domain|w|h)\n";
+    out << "# OunceDesk connections (proto|name|host|port|user|domain|w|h|password)\n";
     for (const auto& p : saved_) {
         out << (p.protocol == ProtocolType::VNC_MACOS ? "VNC" : "RDP") << "|"
             << p.name << "|" << p.host << "|" << p.port << "|"
             << p.username << "|" << p.domain << "|"
-            << p.req_width << "|" << p.req_height << "\n";
+            << p.req_width << "|" << p.req_height << "|"
+            << p.password << "\n";
     }
 }
 
@@ -172,6 +178,12 @@ void ProfileManager::add_or_update(const ConnectionProfile& profile, const std::
     bool updated = false;
     for (auto& s : saved_) {
         if (s.host == clean.host && s.port == clean.port && s.protocol == clean.protocol) {
+            if (clean.password.empty() && !s.password.empty()) {
+                clean.password = s.password;
+            }
+            if (clean.username.empty() && !s.username.empty()) {
+                clean.username = s.username;
+            }
             s = clean;
             updated = true;
             break;

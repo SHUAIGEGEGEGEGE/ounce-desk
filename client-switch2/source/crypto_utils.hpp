@@ -309,10 +309,16 @@ inline bool apple_ard_encrypt_credentials(
         if (mbedtls_mpi_lset(&g, generator) != 0) break;
         if (mbedtls_mpi_read_binary(&server_pub, server_pub_be, key_len) != 0) break;
 
-        // Deterministic-safe private exponent (non-zero, < p)
+        // Fresh random-mixed private exponent on every ARD handshake (never reuse DH public keys!)
+        static uint64_t ard_counter = 0x9E3779B97F4A7C15ULL;
+        ard_counter += 0xBF58476D1CE4E5B9ULL;
         std::vector<uint8_t> priv_bytes(key_len);
+        uint64_t seed = ard_counter ^ (static_cast<uint64_t>(username.size()) << 32) ^ password.size();
         for (size_t i = 0; i < key_len; ++i) {
-            priv_bytes[i] = static_cast<uint8_t>((0x5A + i * 37) ^ (username.size() * 13));
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            priv_bytes[i] = static_cast<uint8_t>((seed + i * 53) & 0xFFu);
         }
         priv_bytes[0] &= 0x7F;
         priv_bytes[key_len - 1] |= 1;

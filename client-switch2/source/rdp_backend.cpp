@@ -405,15 +405,17 @@ bool extract_first_ts_nego_token(const uint8_t* der, size_t len, std::vector<uin
 RdpBackend::~RdpBackend() { disconnect(); }
 
 void RdpBackend::set_status(const std::string& s) {
+    platform::log_line("[RDP] " + s);
     std::lock_guard<std::mutex> lk(info_mu_);
     status_text_ = s;
 }
 
 void RdpBackend::set_error(const std::string& e) {
+    platform::log_line("[RDP ERROR] " + e);
     {
         std::lock_guard<std::mutex> lk(info_mu_);
         error_msg_ = e;
-        status_text_ = "Error: " + e;
+        status_text_ = "错误: " + e;
     }
     state_.store(BackendState::ERROR_STATE);
 }
@@ -635,7 +637,7 @@ bool RdpBackend::send_share_data(uint8_t pdu_type2, const uint8_t* data, size_t 
     push_le32(body, share_id_);
     push_u8(body, 0);     // pad1
     push_u8(body, 1);     // streamId = STREAM_LOW
-    push_le16(body, static_cast<uint16_t>(len));
+    push_le16(body, static_cast<uint16_t>(4 + len));  // uncompressedLength includes pduType2..compressedLength (4 bytes)
     push_u8(body, pdu_type2);
     push_u8(body, 0);     // compressedType
     push_le16(body, 0);   // compressedLength
@@ -1053,10 +1055,39 @@ bool RdpBackend::do_client_info_pdu() {
 }
 
 bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
-    if (len < 10) return false;
+    if (len < 14) return false;
+    uint16_t server_originator_id = le16(pdu + 4);
+    if (server_originator_id == 0) server_originator_id = 0x03EA;
     share_id_ = le32(pdu + 6);
 
-    // Build Client Confirm Active PDU
+    // Parse server Demand Active capability sets to echo preferredBitsPerPixel
+    uint16_t server_bpp = 32;
+    uint16_t cb_src_desc = le16(pdu + 10);
+    uint16_t cb_combined_caps = le16(pdu + 12);
+    size_t caps_off = 14 + static_cast<size_t>(cb_src_desc);
+    if (caps_off + 4 <= len && cb_combined_caps >= 4) {
+        uint16_t srv_num_caps = le16(pdu + caps_off);
+        size_t cpos = caps_off + 4;
+        for (uint16_t i = 0; i < srv_num_caps && cpos + 4 <= len; ++i) {
+            uint16_t ctype = le16(pdu + cpos);
+            uint16_t clen  = le16(pdu + cpos + 2);
+            if (clen < 4 || cpos + clen > len) break;
+            if (ctype == 0x0002 && clen >= 16) {
+                uint16_t bpp = le16(pdu + cpos + 4);
+                if (bpp == 15 || bpp == 16 || bpp == 24 || bpp == 32) {
+                    server_bpp = bpp;
+                }
+            }
+            cpos += clen;
+        }
+    }
+
+    platform::log_line("[RDP] Received DemandActive: shareId=" + std::to_string(share_id_) +
+                       " originator=" + std::to_string(server_originator_id) +
+                       " serverBpp=" + std::to_string(server_bpp));
+
+    // Build Client Confirm Active PDU with all 16 mandatory MS-RDPBCGR capability sets
+    // (Matches FreeRDP rdp_write_confirm_active so Windows rdpcorets StateExpectingCA succeeds!)
     std::vector<uint8_t> caps;
     uint16_t num_caps = 0;
 
@@ -1067,88 +1098,181 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
         ++num_caps;
     };
 
-    // 1. General Capability Set (0x0001)
+    // 1. CAPSTYPE_GENERAL (0x0001) - 24 bytes total (20-byte body)
     {
         std::vector<uint8_t> c;
-        push_le16(c, 0x0003);  // OSMAJORTYPE_UNIX
-        push_le16(c, 0x0000);  // OSMINORTYPE_UNSPECIFIED
-        push_le16(c, 0x0200);  // protocolVersion
-        push_le16(c, 0);
-        push_le16(c, 0);       // generalCompressionTypes
-        push_le16(c, 0x0001 | 0x0400 | 0x0080);  // FASTPATH_OUTPUT | NO_BITMAP_COMP_HDR | LONG_CREDENTIALS
-        push_le16(c, 0); push_le16(c, 0); push_le16(c, 0);
-        push_u8(c, 0); push_u8(c, 0);
+        push_le16(c, 0x0001);  // OSMAJORTYPE_WINDOWS
+        push_le16(c, 0x0003);  // OSMINORTYPE_WINDOWS_NT
+        push_le16(c, 0x0200);  // TS_CAPS_PROTOCOLVERSION
+        push_le16(c, 0);       // pad2octetsA
+        push_le16(c, 0);       // generalCompressionTypes = 0
+        // extraFlags: FASTPATH_OUTPUT_SUPPORTED (0x0001) | NO_BITMAP_COMPRESSION_HDR (0x0400) |
+        //             LONG_CREDENTIALS_SUPPORTED (0x0004) | AUTORECONNECT_SUPPORTED (0x0008)
+        // NOTE: Do NOT set 0x0080 (ENC_SALTED_CHECKSUM) when TLS/NLA security is used!
+        push_le16(c, 0x040Du);
+        push_le16(c, 0);       // updateCapabilityFlag
+        push_le16(c, 0);       // remoteUnshareFlag
+        push_le16(c, 0);       // generalCompressionLevel
+        push_u8(c, 1);         // refreshRectSupport = TRUE
+        push_u8(c, 1);         // suppressOutputSupport = TRUE
         add_cap(0x0001, c);
     }
-    // 2. Bitmap Capability Set (0x0002)
+    // 2. CAPSTYPE_BITMAP (0x0002) - 28 bytes total (24-byte body)
     {
         std::vector<uint8_t> c;
-        push_le16(c, 32);                   // preferredBitsPerPixel
-        push_le16(c, 1); push_le16(c, 1); push_le16(c, 1);
-        push_le16(c, profile_.req_width);
-        push_le16(c, profile_.req_height);
-        push_le16(c, 0);
-        push_le16(c, 1);                    // desktopResizeFlag
-        push_le16(c, 1);                    // bitmapCompressionFlag (RLE enabled!)
-        push_u8(c, 0);
-        push_u8(c, 0x01);                   // drawingFlags = DRAW_ALLOW_DYNAMIC_COLOR_FIDELITY
-        push_le16(c, 1);                    // multipleRectangleSupport
-        push_le16(c, 0);
+        push_le16(c, server_bpp);           // preferredBitsPerPixel (echo server's bpp)
+        push_le16(c, 1);                    // receive1BitPerPixel
+        push_le16(c, 1);                    // receive4BitsPerPixel
+        push_le16(c, 1);                    // receive8BitsPerPixel
+        push_le16(c, profile_.req_width);   // desktopWidth
+        push_le16(c, profile_.req_height);  // desktopHeight
+        push_le16(c, 0);                    // pad2octets
+        push_le16(c, 1);                    // desktopResizeFlag = TRUE
+        push_le16(c, 1);                    // bitmapCompressionFlag = TRUE (RLE)
+        push_u8(c, 0);                      // highColorFlags = 0
+        push_u8(c, 0x08);                   // drawingFlags = DRAW_ALLOW_SKIP_ALPHA
+        push_le16(c, 1);                    // multipleRectangleSupport = TRUE
+        push_le16(c, 0);                    // pad2octetsB
         add_cap(0x0002, c);
     }
-    // 3. Order Capability Set (0x0003) — minimal, forces bitmap/surface updates
+    // 3. CAPSTYPE_ORDER (0x0003) - 88 bytes total (84-byte body)
     {
         std::vector<uint8_t> c(84, 0);
-        c[22] = 0x22;  // orderFlags = NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT
+        // Body offsets (relative to byte 4 after capability header):
+        // +0..15: terminalDescriptor (16 bytes 0)
+        // +16..19: pad4octetsA (0)
+        // +20..21: desktopSaveXGranularity = 1
+        c[20] = 1; c[21] = 0;
+        // +22..23: desktopSaveYGranularity = 20
+        c[22] = 20; c[23] = 0;
+        // +24..25: pad2octetsA = 0
+        // +26..27: maximumOrderLevel = ORD_LEVEL_1_ORDERS (1)
+        c[26] = 1; c[27] = 0;
+        // +28..29: numberFonts = 0
+        // +30..31: orderFlags = NEGOTIATEORDERSUPPORT (0x0002) | ZEROBOUNDSDELTASSUPPORT (0x0008) | COLORINDEXSUPPORT (0x0020)
+        c[30] = 0x2A; c[31] = 0x00;
+        // +32..63: orderSupport[32] = all 0 (forces server to send all drawing as Bitmaps!)
+        // +64..65: textFlags = 0
+        // +66..67: orderSupportExFlags = 0
+        // +68..71: pad4octetsB = 0
+        // +72..75: desktopSaveSize = 230400 (0x00038400)
+        c[72] = 0x00; c[73] = 0x84; c[74] = 0x03; c[75] = 0x00;
+        // +76..83: pad2octetsC, pad2octetsD, textANSICodePage, pad2octetsE = 0
         add_cap(0x0003, c);
     }
-    // 4. Input Capability Set (0x000D)
+    // 4. CAPSTYPE_BITMAPCACHE_REV2 (0x0013) - 40 bytes total (36-byte body)
     {
-        std::vector<uint8_t> c(84, 0);
-        // inputFlags: SCANCODES(0x01) | MOUSEX(0x04) | FASTPATH_INPUT(0x08) | UNICODE(0x10) | FASTPATH_INPUT2(0x20)
-        uint16_t iflags = 0x0001 | 0x0004 | 0x0008 | 0x0010 | 0x0020;
-        c[0] = uint8_t(iflags & 0xFF);
-        c[1] = uint8_t(iflags >> 8);
-        c[4] = 0x09; c[5] = 0x04;  // US English layout
-        c[8] = 4;                  // keyboardType
-        c[16] = 12;                // functionKeys
-        add_cap(0x000D, c);
+        std::vector<uint8_t> c(36, 0);
+        add_cap(0x0013, c);
     }
-    // 5. Pointer Capability Set (0x0008)
+    // 5. CAPSTYPE_COLORCACHE (0x000A) - 8 bytes total (4-byte body)
     {
         std::vector<uint8_t> c;
-        push_le16(c, 1);   // colorPointerFlag
-        push_le16(c, 20);  // colorPointerCacheSize
-        push_le16(c, 20);  // pointerCacheSize
+        push_le16(c, 6);  // colorTableCacheSize = 6
+        push_le16(c, 0);  // pad2octets
+        add_cap(0x000A, c);
+    }
+    // 6. CAPSTYPE_ACTIVATION (0x0007) - 12 bytes total (8-byte body)
+    {
+        std::vector<uint8_t> c(8, 0);
+        add_cap(0x0007, c);
+    }
+    // 7. CAPSTYPE_CONTROL (0x0005) - 12 bytes total (8-byte body)
+    {
+        std::vector<uint8_t> c;
+        push_le16(c, 0);  // controlFlags
+        push_le16(c, 0);  // remoteDetachFlag
+        push_le16(c, 2);  // controlInterest = CONTROLPRIORITY_NEVER
+        push_le16(c, 2);  // detachInterest = CONTROLPRIORITY_NEVER
+        add_cap(0x0005, c);
+    }
+    // 8. CAPSTYPE_POINTER (0x0008) - 10 bytes total (6-byte body)
+    {
+        std::vector<uint8_t> c;
+        push_le16(c, 1);   // colorPointerFlag = TRUE
+        push_le16(c, 20);  // colorPointerCacheSize = 20
+        push_le16(c, 20);  // pointerCacheSize = 20
         add_cap(0x0008, c);
     }
-    // 6. Surface Commands Capability Set (0x001C)
+    // 9. CAPSTYPE_SHARE (0x0009) - 8 bytes total (4-byte body)
     {
         std::vector<uint8_t> c;
-        push_le32(c, 0x00000002u | 0x00000010u | 0x00000040u);  // SET_SURFACE_BITS | FRAMEMARKER | STREAM_SURFACE_BITS
-        push_le32(c, 0);
-        add_cap(0x001C, c);
+        push_le16(c, 0);  // nodeId = 0
+        push_le16(c, 0);  // pad2octets
+        add_cap(0x0009, c);
+    }
+    // 10. CAPSTYPE_BRUSH (0x000F) - 8 bytes total (4-byte body)
+    {
+        std::vector<uint8_t> c;
+        push_le32(c, 0);  // brushSupportLevel = BRUSH_DEFAULT
+        add_cap(0x000F, c);
+    }
+    // 11. CAPSTYPE_GLYPHCACHE (0x0010) - 52 bytes total (48-byte body)
+    {
+        std::vector<uint8_t> c(48, 0);
+        add_cap(0x0010, c);
+    }
+    // 12. CAPSTYPE_OFFSCREENCACHE (0x0011) - 12 bytes total (8-byte body)
+    {
+        std::vector<uint8_t> c(8, 0);
+        add_cap(0x0011, c);
+    }
+    // 13. CAPSTYPE_SOUND (0x000C) - 8 bytes total (4-byte body)
+    {
+        std::vector<uint8_t> c;
+        push_le16(c, 0);  // soundFlags = 0
+        push_le16(c, 0);  // pad2octetsA
+        add_cap(0x000C, c);
+    }
+    // 14. CAPSTYPE_INPUT (0x000D) - 88 bytes total (84-byte body)
+    {
+        std::vector<uint8_t> c(84, 0);
+        // inputFlags: INPUT_FLAG_SCANCODES (0x0001) | INPUT_FLAG_MOUSEX (0x0004) |
+        //             INPUT_FLAG_FASTPATH_INPUT (0x0008) | INPUT_FLAG_UNICODE (0x0010) |
+        //             INPUT_FLAG_FASTPATH_INPUT2 (0x0020)
+        uint16_t iflags = 0x003Du;
+        c[0] = uint8_t(iflags & 0xFF);
+        c[1] = uint8_t(iflags >> 8);
+        c[4] = 0x09; c[5] = 0x04;  // keyboardLayout = 0x0409
+        c[8] = 4;                  // keyboardType = 4 (IBM enhanced 101/102)
+        c[16] = 12;                // keyboardFunctionKey = 12
+        add_cap(0x000D, c);
+    }
+    // 15. CAPSTYPE_FONT (0x000E) - 8 bytes total (4-byte body)
+    {
+        std::vector<uint8_t> c;
+        push_le16(c, 0x0001);  // fontSupportFlags = FONTSUPPORT_FONTLIST
+        push_le16(c, 0);
+        add_cap(0x000E, c);
+    }
+    // 16. CAPSTYPE_VIRTUALCHANNEL (0x0014) - 12 bytes total (8-byte body)
+    {
+        std::vector<uint8_t> c;
+        push_le32(c, 0);     // flags = VCCAPS_NO_COMPR
+        push_le32(c, 1600);  // VCChunkSize = 1600
+        add_cap(0x0014, c);
     }
 
-    const char* src_desc = "OunceDesk";
+    const char* src_desc = "MSTSC";
     uint16_t src_len = static_cast<uint16_t>(std::strlen(src_desc) + 1);
 
     std::vector<uint8_t> confirm;
     push_le32(confirm, share_id_);
-    push_le16(confirm, 0x03EA);  // originatorId
+    push_le16(confirm, server_originator_id);
     push_le16(confirm, src_len);
     push_le16(confirm, static_cast<uint16_t>(4 + caps.size()));
     confirm.insert(confirm.end(), src_desc, src_desc + src_len);
     push_le16(confirm, num_caps);
-    push_le16(confirm, 0);
+    push_le16(confirm, 0);  // pad2Octets
     confirm.insert(confirm.end(), caps.begin(), caps.end());
 
     if (!send_share_control(0x03, confirm.data(), confirm.size())) return false;  // PDUTYPE_CONFIRMACTIVEPDU
+    platform::log_line("[RDP] Sent ConfirmActive (16 capability sets)");
 
-    // Synchronize (0x1F)
+    // Synchronize PDU (0x1F)
     std::vector<uint8_t> sync;
-    push_le16(sync, 1);
-    push_le16(sync, 1002);
+    push_le16(sync, 1);  // messageType = SYNCMSGTYPE_SYNC
+    push_le16(sync, mcs_user_id_);
     if (!send_share_data(0x1F, sync.data(), sync.size())) return false;
 
     // Control Cooperate (0x14, action=4) + Control Request Control (action=1)
@@ -1168,11 +1292,13 @@ bool RdpBackend::handle_demand_active(const uint8_t* pdu, size_t len) {
         std::lock_guard<std::mutex> lk(fb_mu_);
         fb_w_ = profile_.req_width;
         fb_h_ = profile_.req_height;
-        fb_rgba_.assign(static_cast<size_t>(fb_w_) * fb_h_, 0xFF0A0E18u);
+        if (static_cast<int>(fb_rgba_.size()) != fb_w_ * fb_h_) {
+            fb_rgba_.assign(static_cast<size_t>(fb_w_) * fb_h_, 0xFF0A0E18u);
+        }
         full_dirty_ = true;
     }
     state_.store(BackendState::STREAMING);
-    set_status("Connected to Windows RDP " + profile_.host);
+    set_status("已连接 Windows 远程桌面 " + profile_.host);
     return true;
 }
 
@@ -1505,10 +1631,18 @@ void RdpBackend::run_session() {
             if (total > 4 && !transport_recv(tpkt.data(), total - 4)) break;
 
             // Locate MCS SendDataIndication (0x68) payload
+            if (tpkt.size() < 8) continue;
+            if ((tpkt[3] >> 2) == 8) {
+                // MCS DisconnectProviderUltimatum (0x20 / 0x21)
+                platform::log_line("[RDP] Received MCS DisconnectProviderUltimatum");
+                if (!stop_.load()) set_error("Windows 远程桌面已断开连接");
+                break;
+            }
             if (tpkt.size() < 12 || tpkt[3] != 0x68) continue;
+            uint16_t channel_id = static_cast<uint16_t>((tpkt[6] << 8) | tpkt[7]);
             size_t off = 10;
             if (tpkt[9] & 0x80) off = 11;  // 2-byte PER length
-            if (off + 6 > tpkt.size()) continue;
+            if (channel_id != mcs_io_channel_ || off + 6 > tpkt.size()) continue;
 
             const uint8_t* pdu = tpkt.data() + off;
             size_t plen = tpkt.size() - off;
@@ -1517,12 +1651,12 @@ void RdpBackend::run_session() {
             if (pdu_type == 0x01) {
                 // PDUTYPE_DEMANDACTIVEPDU (initial connect OR after Windows login screen transition!)
                 if (!handle_demand_active(pdu, plen)) {
-                    set_error("Failed Confirm Active PDU");
+                    set_error("Confirm Active 握手失败");
                     break;
                 }
             } else if (pdu_type == 0x06) {
                 // PDUTYPE_DEACTIVATEALLPDU — Windows is transitioning session; wait for next Demand Active!
-                set_status("Switching Windows desktop session...");
+                set_status("正在切换 Windows 桌面会话...");
             } else if (pdu_type == 0x07 && plen >= 18) {
                 // PDUTYPE_DATAPDU
                 uint8_t pdu_type2 = pdu[14];
@@ -1533,6 +1667,10 @@ void RdpBackend::run_session() {
                         handle_bitmap_update(pdu + 18, plen - 18);
                         ++frames_win;
                     }
+                } else if (pdu_type2 == 0x2F && plen >= 22) {
+                    // PDUTYPE2_SET_ERROR_INFO_PDU
+                    uint32_t err_info = le32(pdu + 18);
+                    platform::log_line("[RDP] Server SetErrorInfo: " + std::to_string(err_info));
                 }
             }
         } else if ((b0 & 0x03) == 0x00) {
@@ -1554,22 +1692,36 @@ void RdpBackend::run_session() {
             if (!transport_recv(fp.data(), fp.size())) break;
 
             size_t pos = 0;
+            // Skip optional 8-byte FIPS/MAC signature if FASTPATH_OUTPUT_SECURE_CHECKSUM or ENCRYPTED is set
+            if ((b0 & 0xC0) != 0 && fp.size() >= 8) {
+                pos += 8;
+            }
             while (pos < fp.size()) {
                 uint8_t uhdr = fp[pos++];
                 uint8_t ucode = uhdr & 0x0Fu;
+                uint8_t frag  = (uhdr >> 4) & 0x03;
+                uint8_t comp  = (uhdr >> 6) & 0x03;
+                uint8_t comp_flags = 0;
+                if (comp & 0x02) {
+                    if (pos >= fp.size()) break;
+                    comp_flags = fp[pos++];
+                }
                 if (pos + 2 > fp.size()) break;
                 uint16_t usize = le16(fp.data() + pos);
                 pos += 2;
                 if (pos + usize > fp.size()) break;
 
-                if (ucode == 0x01) {
-                    // FASTPATH_UPDATETYPE_BITMAP
-                    handle_bitmap_update(fp.data() + pos, usize);
-                    ++frames_win;
-                } else if (ucode == 0x04) {
-                    // FASTPATH_UPDATETYPE_SURFCMDS
-                    handle_surface_commands(fp.data() + pos, usize);
-                    ++frames_win;
+                // Only decode un-compressed (comp_flags == 0) single/reassembled updates
+                if ((comp_flags & 0x20) == 0 && (frag == 0)) {
+                    if (ucode == 0x01) {
+                        // FASTPATH_UPDATETYPE_BITMAP
+                        handle_bitmap_update(fp.data() + pos, usize);
+                        ++frames_win;
+                    } else if (ucode == 0x04) {
+                        // FASTPATH_UPDATETYPE_SURFCMDS
+                        handle_surface_commands(fp.data() + pos, usize);
+                        ++frames_win;
+                    }
                 }
                 pos += usize;
             }

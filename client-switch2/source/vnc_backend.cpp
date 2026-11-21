@@ -45,15 +45,17 @@ inline uint32_t cpixel_to_rgba(const uint8_t* p) {
 VncBackend::~VncBackend() { disconnect(); }
 
 void VncBackend::set_status(const std::string& s) {
+    platform::log_line("[VNC] " + s);
     std::lock_guard<std::mutex> lk(info_mu_);
     status_text_ = s;
 }
 
 void VncBackend::set_error(const std::string& e) {
+    platform::log_line("[VNC ERROR] " + e);
     {
         std::lock_guard<std::mutex> lk(info_mu_);
         error_msg_ = e;
-        status_text_ = "Error: " + e;
+        status_text_ = "错误: " + e;
     }
     state_.store(BackendState::ERROR_STATE);
 }
@@ -486,140 +488,166 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
 }
 
 void VncBackend::run_session() {
-    // 1. Resolve & TCP connect
-    addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
     std::string port_s = std::to_string(profile_.port);
-    if (getaddrinfo(profile_.host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res) {
-        set_error("Cannot resolve host: " + profile_.host);
-        return;
-    }
+    std::string auth_label;
+    bool had_type_2 = false;
+    bool tried_ard = false;
 
-    int s = static_cast<int>(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-    if (s < 0) {
-        freeaddrinfo(res);
-        set_error("Socket creation failed");
-        return;
-    }
-    int one = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    auto connect_and_auth = [&](bool allow_ard) -> bool {
+        if (sock_ >= 0) {
+            CLOSE_SOCK(sock_);
+            sock_ = -1;
+        }
+        addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(profile_.host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res) {
+            set_error("无法解析主机: " + profile_.host);
+            return false;
+        }
+
+        int s = static_cast<int>(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+        if (s < 0) {
+            freeaddrinfo(res);
+            set_error("创建套接字失败");
+            return false;
+        }
+        int one = 1;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
 #ifdef _WIN32
-    DWORD tv = 5000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        DWORD tv = 5000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #else
-    timeval tv{5, 0};
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        timeval tv{5, 0};
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 
-    if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
+        if (connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
+            freeaddrinfo(res);
+            CLOSE_SOCK(s);
+            set_error("无法连接 " + profile_.host + ":" + port_s + " (请检查 Mac 屏幕共享是否开启)");
+            return false;
+        }
         freeaddrinfo(res);
-        CLOSE_SOCK(s);
-        set_error("Cannot connect to " + profile_.host + ":" + port_s + " (Check macOS Screen Sharing)");
-        return;
-    }
-    freeaddrinfo(res);
-    sock_ = s;
+        sock_ = s;
 
-    // 2. RFB ProtocolVersion Handshake
-    state_.store(BackendState::AUTHENTICATING);
-    set_status("RFB 3.8 Handshake...");
-    char ver[13]{};
-    if (!recv_all(reinterpret_cast<uint8_t*>(ver), 12) || std::strncmp(ver, "RFB ", 4) != 0) {
-        set_error("Not a valid VNC/RFB server");
-        return;
-    }
-    const char* cli_ver = "RFB 003.008\n";
-    if (!send_all(reinterpret_cast<const uint8_t*>(cli_ver), 12)) {
-        set_error("Failed sending RFB version");
-        return;
-    }
+        state_.store(BackendState::AUTHENTICATING);
+        set_status("正在与 macOS 屏幕共享握手 (RFB 3.8)...");
+        char ver[13]{};
+        if (!recv_all(reinterpret_cast<uint8_t*>(ver), 12) || std::strncmp(ver, "RFB ", 4) != 0) {
+            set_error("目标端口不是有效的 VNC/RFB 服务");
+            return false;
+        }
+        const char* cli_ver = "RFB 003.008\n";
+        if (!send_all(reinterpret_cast<const uint8_t*>(cli_ver), 12)) {
+            set_error("发送 RFB 版本号失败");
+            return false;
+        }
 
-    // 3. Security Types Negotiation (None=1, VNC-DES=2, Apple-ARD=30)
-    uint8_t num_types = 0;
-    if (!recv_all(&num_types, 1) || num_types == 0) {
-        set_error("Server rejected RFB handshake");
-        return;
-    }
-    std::vector<uint8_t> sec_types(num_types);
-    if (!recv_all(sec_types.data(), num_types)) {
-        set_error("Failed reading security types");
-        return;
-    }
+        uint8_t num_types = 0;
+        if (!recv_all(&num_types, 1) || num_types == 0) {
+            set_error("服务端拒绝 RFB 握手");
+            return false;
+        }
+        std::vector<uint8_t> sec_types(num_types);
+        if (!recv_all(sec_types.data(), num_types)) {
+            set_error("读取安全认证类型失败");
+            return false;
+        }
 
-    auto has_type = [&](uint8_t t) {
-        return std::find(sec_types.begin(), sec_types.end(), t) != sec_types.end();
+        auto has_type = [&](uint8_t t) {
+            return std::find(sec_types.begin(), sec_types.end(), t) != sec_types.end();
+        };
+        had_type_2 = has_type(2);
+
+        uint8_t chosen = 0;
+        if (allow_ard && has_type(30) && !profile_.username.empty()) {
+            chosen = 30;
+            tried_ard = true;
+            auth_label = "VNC 5900 (Apple ARD)";
+        } else if (has_type(2)) {
+            chosen = 2;
+            auth_label = "VNC 5900 (VNC 密码)";
+        } else if (allow_ard && has_type(30)) {
+            chosen = 30;
+            tried_ard = true;
+            auth_label = "VNC 5900 (Apple ARD)";
+        } else if (has_type(1)) {
+            chosen = 1;
+            auth_label = "VNC 5900 (免密)";
+        } else {
+            set_error("不支持的 VNC 认证类型 (请填写 macOS 用户名或开启 VNC 密码)");
+            return false;
+        }
+
+        platform::log_line("[VNC] Chosen security type=" + std::to_string(chosen) +
+                           " user='" + profile_.username + "' passLen=" + std::to_string(profile_.password.size()));
+
+        if (!send_all(&chosen, 1)) {
+            set_error("发送安全类型失败");
+            return false;
+        }
+
+        if (chosen == 2) {
+            set_status("正在验证 VNC 密码...");
+            uint8_t challenge[16], response[16];
+            if (!recv_all(challenge, 16)) { set_error("读取 VNC 挑战码失败"); return false; }
+            crypto::vnc_des_encrypt_challenge(profile_.password, challenge, response);
+            if (!send_all(response, 16)) { set_error("发送 VNC 响应失败"); return false; }
+        } else if (chosen == 30) {
+            set_status("正在验证 macOS Apple ARD 账户密码...");
+            uint8_t hdr[4];
+            if (!recv_all(hdr, 4)) { set_error("读取 Apple ARD 头失败"); return false; }
+            uint16_t gen = be16(hdr);
+            uint16_t key_len = be16(hdr + 2);
+            if (key_len == 0 || key_len > 1024) { set_error("无效的 ARD 密钥长度"); return false; }
+            std::vector<uint8_t> prime(key_len), srv_pub(key_len);
+            if (!recv_all(prime.data(), key_len) || !recv_all(srv_pub.data(), key_len)) {
+                set_error("读取 Apple ARD DH 参数失败");
+                return false;
+            }
+            std::vector<uint8_t> cli_pub;
+            uint8_t cipher[128];
+            if (!crypto::apple_ard_encrypt_credentials(
+                    gen, prime.data(), key_len, srv_pub.data(),
+                    profile_.username, profile_.password, cli_pub, cipher)) {
+                set_error("Apple ARD 加密失败");
+                return false;
+            }
+            std::vector<uint8_t> resp;
+            resp.reserve(128 + cli_pub.size());
+            resp.insert(resp.end(), cipher, cipher + 128);
+            resp.insert(resp.end(), cli_pub.begin(), cli_pub.end());
+            if (!send_all(resp.data(), resp.size())) {
+                set_error("发送 Apple ARD 凭据失败");
+                return false;
+            }
+        }
+
+        uint8_t sec_res[4];
+        if (!recv_all(sec_res, 4) || be32(sec_res) != 0) {
+            platform::log_line("[VNC] SecurityResult failed for type " + std::to_string(chosen));
+            return false;
+        }
+        return true;
     };
 
-    uint8_t chosen = 0;
-    std::string auth_label;
-    // Prefer Apple ARD (30) on macOS when username is provided; otherwise VNC Auth (2) or None (1)
-    if (has_type(30) && !profile_.username.empty()) {
-        chosen = 30;
-        auth_label = "VNC 5900 (Apple ARD)";
-    } else if (has_type(2)) {
-        chosen = 2;
-        auth_label = "VNC 5900 (VNC Auth)";
-    } else if (has_type(30)) {
-        chosen = 30;
-        auth_label = "VNC 5900 (Apple ARD)";
-    } else if (has_type(1)) {
-        chosen = 1;
-        auth_label = "VNC 5900 (Open)";
-    } else {
-        set_error("Unsupported VNC auth type (enable VNC password or enter macOS username)");
-        return;
-    }
-
-    if (!send_all(&chosen, 1)) {
-        set_error("Failed sending security type");
-        return;
-    }
-
-    if (chosen == 2) {
-        // Classic VNC DES challenge-response
-        set_status("Authenticating (VNC Password)...");
-        uint8_t challenge[16], response[16];
-        if (!recv_all(challenge, 16)) { set_error("Failed reading VNC challenge"); return; }
-        crypto::vnc_des_encrypt_challenge(profile_.password, challenge, response);
-        if (!send_all(response, 16)) { set_error("Failed sending VNC response"); return; }
-    } else if (chosen == 30) {
-        // Apple Remote Desktop (macOS native Screen Sharing username + password)
-        set_status("Authenticating (macOS Apple ARD)...");
-        uint8_t hdr[4];
-        if (!recv_all(hdr, 4)) { set_error("Failed reading Apple ARD header"); return; }
-        uint16_t gen = be16(hdr);
-        uint16_t key_len = be16(hdr + 2);
-        if (key_len == 0 || key_len > 1024) { set_error("Invalid ARD key length"); return; }
-        std::vector<uint8_t> prime(key_len), srv_pub(key_len);
-        if (!recv_all(prime.data(), key_len) || !recv_all(srv_pub.data(), key_len)) {
-            set_error("Failed reading Apple ARD DH parameters");
+    if (!connect_and_auth(true)) {
+        // Automatic fallback: if Apple ARD (30) failed and server also supports VNC Password (2), retry with Type 2!
+        if (!stop_.load() && tried_ard && had_type_2) {
+            platform::log_line("[VNC] Apple ARD (30) failed; automatically falling back to VNC Password (2)...");
+            if (!connect_and_auth(false)) {
+                set_error("Mac 登录失败：请检查 macOS 用户名与密码 (或 VNC 密码)");
+                return;
+            }
+        } else {
+            if (state_.load() != BackendState::ERROR_STATE) {
+                set_error("Mac 登录失败：请检查 macOS 用户名与密码 (或 VNC 密码)");
+            }
             return;
         }
-        std::vector<uint8_t> cli_pub;
-        uint8_t cipher[128];
-        if (!crypto::apple_ard_encrypt_credentials(
-                gen, prime.data(), key_len, srv_pub.data(),
-                profile_.username, profile_.password, cli_pub, cipher)) {
-            set_error("Apple ARD crypto failure");
-            return;
-        }
-        std::vector<uint8_t> resp;
-        resp.reserve(128 + cli_pub.size());
-        resp.insert(resp.end(), cipher, cipher + 128);
-        resp.insert(resp.end(), cli_pub.begin(), cli_pub.end());
-        if (!send_all(resp.data(), resp.size())) {
-            set_error("Failed sending Apple ARD credentials");
-            return;
-        }
-    }
-
-    uint8_t sec_res[4];
-    if (!recv_all(sec_res, 4) || be32(sec_res) != 0) {
-        set_error("Authentication failed (wrong macOS username/password or VNC password)");
-        return;
     }
 
     // 4. ClientInit (shared = 1) -> ServerInit

@@ -3,7 +3,9 @@
 #include "platform.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
+#include <mutex>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -19,6 +21,20 @@ using socklen_t = int;
 #endif
 
 namespace platform {
+
+namespace {
+std::mutex g_log_mu;
+}
+
+void log_line(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    FILE* f = std::fopen("config/ouncedesk.log", "a");
+    if (f) {
+        uint64_t ms = now_us() / 1000ULL;
+        std::fprintf(f, "[%llu ms] %s\n", static_cast<unsigned long long>(ms), msg.c_str());
+        std::fclose(f);
+    }
+}
 
 bool init() {
 #ifdef _WIN32

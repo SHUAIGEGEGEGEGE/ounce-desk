@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <sys/stat.h>
 #include <switch.h>
 
@@ -19,6 +21,7 @@ bool g_kbd_ok = false;
 bool g_mouse_ok = false;
 PlFontData g_shared_font{};
 bool g_has_shared_font = false;
+std::mutex g_log_mu;
 
 HidKeyboardState g_prev_kbd{};
 HidMouseState g_prev_mouse{};
@@ -26,7 +29,20 @@ bool g_has_prev_kbd = false;
 bool g_has_prev_mouse = false;
 }  // namespace
 
+void log_line(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    FILE* f = std::fopen("sdmc:/switch/OunceDesk/ouncedesk.log", "a");
+    if (f) {
+        uint64_t ms = now_us() / 1000ULL;
+        std::fprintf(f, "[%llu ms] %s\n", static_cast<unsigned long long>(ms), msg.c_str());
+        std::fclose(f);
+    }
+}
+
 bool init() {
+    mkdir("sdmc:/switch", 0755);
+    mkdir("sdmc:/switch/OunceDesk", 0755);
+
     if (R_SUCCEEDED(socketInitializeDefault())) {
         g_socket_ok = true;
     }
@@ -35,13 +51,16 @@ bool init() {
     }
     if (R_SUCCEEDED(plInitialize(PlServiceType_User))) {
         g_pl_ok = true;
-        if (R_SUCCEEDED(plGetSharedFontByType(&g_shared_font, PlSharedFontType_Standard))) {
+        // Prefer Simplified Chinese system font so full Chinese UI renders natively on Switch 2!
+        if (R_SUCCEEDED(plGetSharedFontByType(&g_shared_font, PlSharedFontType_ChineseSimplified)) &&
+            g_shared_font.address && g_shared_font.size > 0) {
+            g_has_shared_font = true;
+        } else if (R_SUCCEEDED(plGetSharedFontByType(&g_shared_font, PlSharedFontType_Standard)) &&
+                   g_shared_font.address && g_shared_font.size > 0) {
             g_has_shared_font = true;
         }
     }
 
-    // Lock libounce native touch output range to exact 1920x1080 (read directly via hidGetTouchScreenStates,
-    // bypassing switch-sdl2's legacy Switch 1 1280x720 scaling that caused touch drift!)
     hidSetTouchScreenOutputRanges(1920, 1080);
     hidInitializeTouchScreen();
     hidInitializeKeyboard();
@@ -49,12 +68,12 @@ bool init() {
     hidInitializeMouse();
     g_mouse_ok = true;
 
-    mkdir("sdmc:/switch", 0755);
-    mkdir("sdmc:/switch/OunceDesk", 0755);
+    log_line("=== OunceDesk started (Switch 2 kaiHEN, shared_font=" + std::string(g_has_shared_font ? "yes" : "no") + ") ===");
     return g_socket_ok;
 }
 
 void shutdown() {
+    log_line("=== OunceDesk shutdown ===");
     if (g_pl_ok) {
         plExit();
         g_pl_ok = false;
@@ -103,7 +122,7 @@ bool show_system_keyboard(const std::string& header, const std::string& initial,
         }
     }
     swkbdConfigSetHeaderText(&kbd, header.c_str());
-    if (!initial.empty() && !password_mode) {
+    if (!initial.empty()) {
         swkbdConfigSetInitialText(&kbd, initial.c_str());
     }
 

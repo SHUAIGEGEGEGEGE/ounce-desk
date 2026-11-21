@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
 
     auto start_connection = [&](const ConnectionProfile& p) {
         if (p.host.empty()) {
-            form_error = "Please enter Host IP address";
+            form_error = "请输入电脑 IP 地址";
             return;
         }
         active_profile = p;
@@ -152,32 +152,32 @@ int main(int argc, char* argv[]) {
             draft.port = (draft.protocol == ProtocolType::VNC_MACOS) ? 5900 : 3389;
         } else if (field_idx == 1) {
             std::string v;
-            if (platform::show_system_keyboard("Host IP Address (e.g. 192.168.1.50)", draft.host, v, false, false)) {
+            if (platform::show_system_keyboard("请输入电脑 IP 地址 (如 192.168.33.186)", draft.host, v, false, false)) {
                 draft.host = v;
             }
         } else if (field_idx == 2) {
             std::string v;
-            if (platform::show_system_keyboard("TCP Port (3389 Windows / 5900 macOS)", std::to_string(draft.port), v, true, false)) {
+            if (platform::show_system_keyboard("请输入端口号 (Windows 3389 / Mac 5900)", std::to_string(draft.port), v, true, false)) {
                 int p = std::atoi(v.c_str());
                 if (p > 0 && p <= 65535) draft.port = static_cast<uint16_t>(p);
             }
         } else if (field_idx == 3) {
             std::string v;
             std::string hdr = (draft.protocol == ProtocolType::VNC_MACOS)
-                                  ? "macOS Username (leave empty if using VNC password)"
-                                  : "Windows Username";
+                                  ? "请输入 macOS 用户名 (若仅用 VNC 密码可留空)"
+                                  : "请输入 Windows 登录用户名";
             if (platform::show_system_keyboard(hdr, draft.username, v, false, false)) {
                 draft.username = v;
             }
         } else if (field_idx == 4) {
             std::string v;
-            if (platform::show_system_keyboard("Enter Password", "", v, false, true)) {
+            if (platform::show_system_keyboard("请输入登录密码", draft.password, v, false, true)) {
                 draft.password = v;
             }
         } else if (field_idx == 5) {
             if (draft.protocol == ProtocolType::VNC_MACOS) {
                 std::string v;
-                if (platform::show_system_keyboard("Display Name", draft.name, v, false, false)) draft.name = v;
+                if (platform::show_system_keyboard("请输入设备备注名称", draft.name, v, false, false)) draft.name = v;
             } else {
                 if (draft.req_width == 1920) { draft.req_width = 1280; draft.req_height = 720; }
                 else { draft.req_width = 1920; draft.req_height = 1080; }
@@ -188,7 +188,7 @@ int main(int argc, char* argv[]) {
     auto open_streaming_swkbd = [&]() {
         if (!backend) return;
         std::string typed;
-        if (platform::show_system_keyboard("Type text (Switch 2 Native Keyboard)", "", typed, false, false)) {
+        if (platform::show_system_keyboard("请输入要发送到远程电脑的文字", "", typed, false, false)) {
             if (!typed.empty()) backend->send_text_utf8(typed);
         } else {
             // Desktop fallback when native swkbd does not exist
@@ -202,7 +202,7 @@ int main(int argc, char* argv[]) {
         } else if (id == "hm:scan") {
             profiles.start_lan_scan();
             show_home_menu = false;
-            status_banner = "Scanning LAN for Windows (3389) and macOS (5900)...";
+            status_banner = "正在扫描局域网内的 Windows (3389) 与 macOS (5900) 电脑...";
         } else if (id == "hm:add_rdp") {
             open_new_form(ProtocolType::RDP_WINDOWS);
         } else if (id == "hm:add_mac") {
@@ -243,7 +243,7 @@ int main(int argc, char* argv[]) {
             show_overlay = false;
             show_osk = false;
             mode = AppMode::BROWSER;
-            status_banner = "Disconnected.";
+            status_banner = "已断开远程连接。";
         } else if (id == "act:exit_app") {
             running = false;
         }
@@ -320,7 +320,7 @@ int main(int argc, char* argv[]) {
                     else if (btn.id == "home_mode") input.toggle_touch_mode();
                     else if (btn.id == "scan_lan") {
                         profiles.start_lan_scan();
-                        status_banner = "Scanning LAN for Windows (3389) and macOS (5900)...";
+                        status_banner = "正在扫描局域网内的 Windows (3389) 与 macOS (5900) 电脑...";
                     } else if (btn.id == "open_menu") {
                         show_home_menu = true;
                         home_menu_focus = 0;
@@ -505,7 +505,7 @@ int main(int argc, char* argv[]) {
                     (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE)) {
                     if (backend) { backend->disconnect(); backend.reset(); }
                     mode = AppMode::BROWSER;
-                    status_banner = "Connection canceled.";
+                    status_banner = "已取消连接。";
                 }
             } else if (mode == AppMode::STREAMING && backend) {
                 // '+' button directly opens/closes Menu!
@@ -588,7 +588,7 @@ int main(int argc, char* argv[]) {
             SDL_Rect box{LOGICAL_W / 2 - 440, LOGICAL_H / 2 - 90, 880, 180};
             ui.draw_panel(box, {22, 29, 44, 245}, {56, 189, 248, 255});
             ui.draw_text(box.x + 36, box.y + 42, backend->status_text(), {241, 245, 249, 255}, 2);
-            ui.draw_text(box.x + 36, box.y + 108, "Press [B] or [+] to cancel", {148, 163, 184, 255}, 2);
+            ui.draw_text(box.x + 36, box.y + 108, "按 [B] 或 [+] 键取消连接", {148, 163, 184, 255}, 2);
         } else if (mode == AppMode::STREAMING && backend) {
             backend->sync_texture(renderer, fb_texture, fb_w, fb_h);
             SDL_SetRenderDrawColor(renderer, 6, 8, 12, 255);
@@ -598,7 +598,7 @@ int main(int argc, char* argv[]) {
                 input.update_viewport_rect(LOGICAL_W, LOGICAL_H, fb_w, fb_h);
                 SDL_RenderCopy(renderer, fb_texture, nullptr, &input.viewport().dst_rect);
             } else {
-                ui.draw_text(LOGICAL_W / 2 - 200, LOGICAL_H / 2 - 12, "Waiting for remote desktop...", {200, 215, 235, 255}, 2);
+                ui.draw_text(LOGICAL_W / 2 - 200, LOGICAL_H / 2 - 12, "正在等待远程桌面画面...", {200, 215, 235, 255}, 2);
             }
 
             if (input.touch_mode() == TouchMode::MOUSE) {
