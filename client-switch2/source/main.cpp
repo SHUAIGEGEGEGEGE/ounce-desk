@@ -5,6 +5,13 @@
 #include "rdp_backend.hpp"
 #include "ui_renderer.hpp"
 #include "vnc_backend.hpp"
+#include "wg_tunnel.hpp"
+
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #include <SDL2/SDL.h>
 #include <algorithm>
@@ -27,6 +34,14 @@ int main(int argc, char* argv[]) {
     (void)argv;
 
     platform::init();
+    wg::install_connect_hook();
+
+    const std::string wg_dir = platform::get_config_dir() + "/wg";
+#ifdef _WIN32
+    _mkdir(wg_dir.c_str());
+#else
+    mkdir(wg_dir.c_str(), 0755);
+#endif
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         platform::shutdown();
@@ -111,10 +126,40 @@ int main(int argc, char* argv[]) {
     bool tap_tracking = false;
     float last_tap_x = 960.0f, last_tap_y = 540.0f;
 
-    // Saved-device manager (home menu) + sensitivity slider + macOS keyboard bubble state
+    // Saved-device manager (home menu) + WireGuard manager + sensitivity slider + macOS keyboard bubble state
     bool show_manage = false;
+    bool show_wg = false;
     bool touch_block = false;  // after a modal keyboard: ignore touch until all fingers lifted
     int manage_focus = 0;
+    int wg_focus = 0;
+    std::string saved_wg_name;
+    std::vector<std::string> wg_configs;
+
+    auto reload_wg_configs = [&]() {
+        wg_configs = wg::list_configs(wg_dir);
+        auto root_cfgs = wg::list_configs(platform::get_config_dir());
+        for (const auto& c : root_cfgs) {
+            if (std::find(wg_configs.begin(), wg_configs.end(), c) == wg_configs.end()) {
+                wg_configs.push_back(c);
+            }
+        }
+    };
+    auto start_wg_by_name = [&](const std::string& name) -> bool {
+        wg::Config cfg;
+        std::string err;
+        std::string p1 = wg_dir + "/" + name + ".conf";
+        std::string p2 = platform::get_config_dir() + "/" + name + ".conf";
+        if (!wg::load_config_file(p1, cfg, err) && !wg::load_config_file(p2, cfg, err)) {
+            status_banner = "WireGuard 配置加载失败: " + err;
+            return false;
+        }
+        wg::Tunnel::instance().start(cfg);
+        saved_wg_name = name;
+        status_banner = "正在启动 WireGuard 隧道: " + name;
+        return true;
+    };
+    reload_wg_configs();
+
     bool slider_dragging = false;
     SDL_Rect kbd_bubble{0, 0, 0, 0};
     uint64_t kbd_bubble_until_us = 0;
@@ -125,22 +170,29 @@ int main(int argc, char* argv[]) {
     auto save_settings = [&]() {
         FILE* f = std::fopen(settings_path.c_str(), "w");
         if (!f) return;
-        std::fprintf(f, "sensitivity=%.2f\nauto_ime=%d\ntouch_mode=%d\n", input.sensitivity(), auto_ime ? 1 : 0,
-                     input.touch_mode() == TouchMode::MOUSE ? 1 : 0);
+        std::fprintf(f, "sensitivity=%.2f\nauto_ime=%d\ntouch_mode=%d\nwg_config=%s\n",
+                     input.sensitivity(), auto_ime ? 1 : 0,
+                     input.touch_mode() == TouchMode::MOUSE ? 1 : 0,
+                     saved_wg_name.c_str());
         std::fclose(f);
     };
     {
         FILE* f = std::fopen(settings_path.c_str(), "r");
         if (f) {
-            char line[128];
+            char line[256];
             while (std::fgets(line, sizeof(line), f)) {
                 float fv = 0.0f;
                 int iv = 0;
+                char sv[128]{};
                 if (std::sscanf(line, "sensitivity=%f", &fv) == 1) input.set_sensitivity(fv);
                 else if (std::sscanf(line, "auto_ime=%d", &iv) == 1) auto_ime = (iv != 0);
                 else if (std::sscanf(line, "touch_mode=%d", &iv) == 1) input.set_touch_mode(iv ? TouchMode::MOUSE : TouchMode::TOUCH);
+                else if (std::sscanf(line, "wg_config=%127s", sv) == 1) saved_wg_name = sv;
             }
             std::fclose(f);
+        }
+        if (!saved_wg_name.empty()) {
+            start_wg_by_name(saved_wg_name);
         }
     }
 
@@ -262,7 +314,11 @@ int main(int argc, char* argv[]) {
     };
 
     auto handle_home_menu_action = [&](const std::string& id) {
-        if (id == "hm:mode") {
+        if (id == "hm:wg") {
+            reload_wg_configs();
+            show_wg = true;
+            wg_focus = 0;
+        } else if (id == "hm:mode") {
             input.toggle_touch_mode();
             save_settings();
         } else if (id == "hm:manage") {
@@ -383,6 +439,25 @@ int main(int argc, char* argv[]) {
         // Unified UI tap dispatcher (works identically for Switch 2 native touch AND Desktop mouse)
         auto dispatch_ui_tap = [&](int tap_x, int tap_y) {
             if (mode == AppMode::BROWSER) {
+                if (show_wg) {
+                    for (const auto& btn : active_buttons) {
+                        if (!UIRenderer::hit_test(btn.rect, tap_x, tap_y)) continue;
+                        if (btn.id == "wg:back") {
+                            show_wg = false;
+                        } else if (btn.id == "wg:reload") {
+                            reload_wg_configs();
+                        } else if (btn.id == "wg:off") {
+                            wg::Tunnel::instance().stop();
+                            saved_wg_name.clear();
+                            save_settings();
+                            status_banner = "WireGuard 隧道已关闭";
+                        } else if (btn.id.rfind("wg:use:", 0) == 0) {
+                            if (start_wg_by_name(btn.id.substr(7))) save_settings();
+                        }
+                        break;
+                    }
+                    return;
+                }
                 if (show_manage) {
                     for (const auto& btn : active_buttons) {
                         if (!UIRenderer::hit_test(btn.rect, tap_x, tap_y)) continue;
@@ -411,7 +486,11 @@ int main(int argc, char* argv[]) {
                 }
                 for (const auto& btn : active_buttons) {
                     if (!UIRenderer::hit_test(btn.rect, tap_x, tap_y)) continue;
-                    if (btn.id == "add_rdp") open_new_form(ProtocolType::RDP_WINDOWS);
+                    if (btn.id == "open_wg") {
+                        reload_wg_configs();
+                        show_wg = true;
+                        wg_focus = 0;
+                    } else if (btn.id == "add_rdp") open_new_form(ProtocolType::RDP_WINDOWS);
                     else if (btn.id == "add_mac") open_new_form(ProtocolType::VNC_MACOS);
                     else if (btn.id == "home_mode") { input.toggle_touch_mode(); save_settings(); }
                     else if (btn.id == "scan_lan") {
@@ -572,6 +651,24 @@ int main(int argc, char* argv[]) {
             int dtap_y = desktop_tap ? ev.button.y : 0;
 
             if (mode == AppMode::BROWSER) {
+                if (show_wg) {
+                    if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
+                        auto b = ev.cbutton.button;
+                        int n = static_cast<int>(active_buttons.size());
+                        if (b == SDL_CONTROLLER_BUTTON_B) show_wg = false;
+                        else if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && n > 0) wg_focus = (wg_focus + 1) % n;
+                        else if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && n > 0) wg_focus = (wg_focus - 1 + n) % n;
+                        else if (b == SDL_CONTROLLER_BUTTON_A && wg_focus < n) {
+                            const SDL_Rect& r = active_buttons[wg_focus].rect;
+                            dispatch_ui_tap(r.x + r.w / 2, r.y + r.h / 2);
+                        }
+                    } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
+                        show_wg = false;
+                    } else if (desktop_tap) {
+                        dispatch_ui_tap(dtap_x, dtap_y);
+                    }
+                    continue;
+                }
                 if (show_manage) {
                     if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
                         auto b = ev.cbutton.button;
@@ -795,15 +892,27 @@ int main(int argc, char* argv[]) {
 
         // Render frame in exact 1920x1080 logical space
         if (mode == AppMode::BROWSER || mode == AppMode::FORM) {
+            auto& wgt = wg::Tunnel::instance();
+            auto wgst = wgt.state();
+            std::string wg_badge;
+            if (wgst == wg::State::UP) wg_badge = "WG: " + wgt.active_name();
+            else if (wgst == wg::State::CONNECTING) wg_badge = "WG: 连接中...";
+            else if (wgst == wg::State::FAILED) wg_badge = "WG: 异常";
+
             active_buttons = ui.render_profile_browser(
                 LOGICAL_W, LOGICAL_H, win_profs, mac_profs, selected_col, selected_row,
-                profiles.is_scanning(), profiles.scan_progress_pct(), input.touch_mode(), status_banner);
+                profiles.is_scanning(), profiles.scan_progress_pct(), input.touch_mode(), status_banner,
+                wg_badge, wgst == wg::State::UP);
             if (mode == AppMode::FORM) {
                 active_buttons = ui.render_connect_form(LOGICAL_W, LOGICAL_H, draft, form_focus, form_error);
+            } else if (show_wg) {
+                active_buttons = ui.render_wg_manager(
+                    LOGICAL_W, LOGICAL_H, wg_configs, wgt.active_name(), wgt.status_text(),
+                    wgst == wg::State::UP, wgt.rx_bytes(), wgt.tx_bytes(), wg_focus);
             } else if (show_manage) {
                 active_buttons = ui.render_device_manager(LOGICAL_W, LOGICAL_H, profiles.saved_profiles(), manage_focus);
             } else if (show_home_menu) {
-                active_buttons = ui.render_home_menu(LOGICAL_W, LOGICAL_H, input.touch_mode(), input.sensitivity(), home_menu_focus);
+                active_buttons = ui.render_home_menu(LOGICAL_W, LOGICAL_H, input.touch_mode(), input.sensitivity(), wg_badge, home_menu_focus);
             }
         } else if (mode == AppMode::CONNECTING && backend) {
             SDL_SetRenderDrawColor(renderer, 11, 15, 25, 255);
@@ -845,6 +954,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (backend) backend->disconnect();
+    wg::Tunnel::instance().stop();
     if (fb_texture) SDL_DestroyTexture(fb_texture);
     profiles.stop_lan_scan();
     ui.shutdown();

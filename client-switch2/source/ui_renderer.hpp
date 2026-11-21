@@ -50,13 +50,26 @@ public:
         bool scanning,
         int scan_pct,
         TouchMode tmode,
-        const std::string& status_banner);
+        const std::string& status_banner,
+        const std::string& wg_badge = "",
+        bool wg_active = false);
 
-    // 2. Home '+' Menu (Touch/Mouse mode toggle, Rescan, Quick Add, Exit App)
-    std::vector<UIButton> render_home_menu(int win_w, int win_h, TouchMode tmode, float sensitivity, int focused_idx);
+    // 2. Home '+' Menu (Touch/Mouse mode toggle, Rescan, Quick Add, WireGuard, Exit App)
+    std::vector<UIButton> render_home_menu(int win_w, int win_h, TouchMode tmode, float sensitivity, const std::string& wg_summary, int focused_idx);
 
     // 2b. Saved device manager (delete saved Windows / macOS devices)
     std::vector<UIButton> render_device_manager(int win_w, int win_h, const std::vector<ConnectionProfile>& saved, int focused_idx);
+
+    // 2c. WireGuard userspace VPN manager (select .conf, connect/disconnect, live rx/tx)
+    std::vector<UIButton> render_wg_manager(
+        int win_w, int win_h,
+        const std::vector<std::string>& configs,
+        const std::string& active_name,
+        const std::string& status_line,
+        bool is_up,
+        uint64_t rx_bytes,
+        uint64_t tx_bytes,
+        int focused_idx);
 
     // Mouse sensitivity slider (ids: sens:dec, sens:track, sens:inc). Returns track rect via out_track.
     void render_sens_slider(int x, int y, int w, float sensitivity, std::vector<UIButton>& out);

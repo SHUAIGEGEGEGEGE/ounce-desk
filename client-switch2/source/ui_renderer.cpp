@@ -193,7 +193,9 @@ std::vector<UIButton> UIRenderer::render_profile_browser(
     bool scanning,
     int scan_pct,
     TouchMode tmode,
-    const std::string& status_banner) {
+    const std::string& status_banner,
+    const std::string& wg_badge,
+    bool wg_active) {
 
     std::vector<UIButton> buttons;
 
@@ -203,17 +205,19 @@ std::vector<UIButton> UIRenderer::render_profile_browser(
     // Header Bar
     SDL_Rect header{0, 0, win_w, 106};
     draw_panel(header, COL_PANEL, COL_BORDER);
-    draw_text(36, 22, "OunceDesk 远程桌面", COL_ACCENT, 4);
+    draw_text(32, 22, "OunceDesk", COL_ACCENT, 4);
 
-    std::string mode_lbl = (tmode == TouchMode::TOUCH) ? "模式: 触屏直触" : "模式: 鼠标指针";
-    std::string scan_lbl = scanning ? ("扫描中 " + std::to_string(scan_pct) + "%") : "扫描局域网";
+    std::string mode_lbl = (tmode == TouchMode::TOUCH) ? "模式: 触屏" : "模式: 鼠标";
+    std::string scan_lbl = scanning ? ("扫描 " + std::to_string(scan_pct) + "%") : "扫描局域网";
+    std::string wg_lbl = wg_badge.empty() ? "WG: 未开启" : wg_badge;
 
-    UIButton b_add_rdp{{win_w - 1140, 24, 240, 58}, "add_rdp", "+ Windows (3389)", true, false, false};
-    UIButton b_add_mac{{win_w - 884,  24, 240, 58}, "add_mac", "+ 苹果 Mac (5900)", false, true, false};
-    UIButton b_mode   {{win_w - 628,  24, 204, 58}, "home_mode", mode_lbl, false, false, false};
-    UIButton b_scan   {{win_w - 408,  24, 184, 58}, "scan_lan", scan_lbl, false, false, false};
-    UIButton b_menu   {{win_w - 208,  24, 172, 58}, "open_menu", "+ 菜单", false, false, false};
-    for (auto* b : {&b_add_rdp, &b_add_mac, &b_mode, &b_scan, &b_menu}) {
+    UIButton b_wg     {{win_w - 1340, 24, 210, 58}, "open_wg", wg_lbl, false, wg_active, false};
+    UIButton b_add_rdp{{win_w - 1116, 24, 232, 58}, "add_rdp", "+ Windows (3389)", true, false, false};
+    UIButton b_add_mac{{win_w - 870,  24, 232, 58}, "add_mac", "+ 苹果 Mac (5900)", false, true, false};
+    UIButton b_mode   {{win_w - 624,  24, 196, 58}, "home_mode", mode_lbl, false, false, false};
+    UIButton b_scan   {{win_w - 414,  24, 188, 58}, "scan_lan", scan_lbl, false, false, false};
+    UIButton b_menu   {{win_w - 212,  24, 176, 58}, "open_menu", "+ 菜单", false, false, false};
+    for (auto* b : {&b_wg, &b_add_rdp, &b_add_mac, &b_mode, &b_scan, &b_menu}) {
         draw_button(*b, false);
         buttons.push_back(*b);
     }
@@ -302,26 +306,30 @@ std::vector<UIButton> UIRenderer::render_profile_browser(
     return buttons;
 }
 
-std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMode tmode, float sensitivity, int focused_idx) {
+std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMode tmode, float sensitivity, const std::string& wg_summary, int focused_idx) {
     std::vector<UIButton> buttons;
 
     SDL_SetRenderDrawColor(renderer_, 5, 8, 16, 195);
     SDL_Rect full{0, 0, win_w, win_h};
     SDL_RenderFillRect(renderer_, &full);
 
-    int pw = 760;
-    int ph = 736;
+    int pw = 800;
+    int ph = 800;
     SDL_Rect panel{(win_w - pw) / 2, (win_h - ph) / 2, pw, ph};
     draw_panel(panel, COL_PANEL, COL_ACCENT);
 
-    draw_text(panel.x + 36, panel.y + 22, "OunceDesk 主菜单 (+)", COL_TEXT, 3);
+    draw_text(panel.x + 36, panel.y + 20, "OunceDesk 主菜单 (+)", COL_TEXT, 3);
 
     int bx = panel.x + 48;
     int bw = pw - 96;
-    int y = panel.y + 84;
-    const int bh = 60;
-    const int gap = 12;
+    int y = panel.y + 78;
+    const int bh = 58;
+    const int gap = 11;
 
+    buttons.push_back({{bx, y, bw, bh}, "hm:wg",
+                       "WireGuard 加密隧道: " + (wg_summary.empty() ? std::string("未开启 (点击选择配置连接)") : wg_summary),
+                       false, !wg_summary.empty(), false});
+    y += bh + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:mode",
                        (tmode == TouchMode::TOUCH) ? "控制模式: 触屏直触 (点击切换为鼠标模式)"
                                                    : "控制模式: 鼠标指针 (点击切换为触屏模式)",
@@ -337,7 +345,7 @@ std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMo
     y += bh + gap;
     // Mouse sensitivity slider row
     render_sens_slider(bx, y, bw, sensitivity, buttons);
-    y += bh + gap;
+    y += 60 + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:resume", "关闭菜单", false, true, false});
     y += bh + gap;
     buttons.push_back({{bx, y, bw, bh}, "hm:exit", "退出软件 (返回系统 / hbmenu)", false, false, true});
@@ -354,6 +362,66 @@ std::vector<UIButton> UIRenderer::render_home_menu(int win_w, int win_h, TouchMo
         draw_button(buttons[i], static_cast<int>(i) == focused_idx);
     }
     draw_text(panel.x + 48, panel.y + ph - 34, "提示: 十字键 左/右 也可直接调节鼠标灵敏度", COL_MUTED, 2);
+    return buttons;
+}
+
+std::vector<UIButton> UIRenderer::render_wg_manager(
+    int win_w, int win_h,
+    const std::vector<std::string>& configs,
+    const std::string& active_name,
+    const std::string& status_line,
+    bool is_up,
+    uint64_t rx_bytes,
+    uint64_t tx_bytes,
+    int focused_idx) {
+
+    std::vector<UIButton> buttons;
+    SDL_SetRenderDrawColor(renderer_, 5, 8, 16, 210);
+    SDL_Rect full{0, 0, win_w, win_h};
+    SDL_RenderFillRect(renderer_, &full);
+
+    int pw = 1120;
+    int ph = 840;
+    SDL_Rect panel{(win_w - pw) / 2, (win_h - ph) / 2, pw, ph};
+    draw_panel(panel, COL_PANEL, COL_ACCENT);
+
+    draw_text(panel.x + 36, panel.y + 22, "WireGuard 安全隧道 (应用内用户态 · 零变砖风险)", COL_ACCENT, 3);
+    draw_text(panel.x + 36, panel.y + 66,
+              "将路由器导出的 .conf 放入 /switch/OunceDesk/wg/ 目录即可一键连回家中内网",
+              COL_MUTED, 2);
+
+    SDL_Rect st_box{panel.x + 36, panel.y + 104, pw - 72, 82};
+    draw_panel(st_box, {16, 24, 38, 255}, is_up ? COL_MAC : COL_BORDER);
+    draw_text(st_box.x + 18, st_box.y + 12,
+              status_line.empty() ? "当前状态: WireGuard 未开启 (直连模式)" : status_line,
+              is_up ? COL_MAC : COL_TEXT, 2);
+    char traf[160];
+    std::snprintf(traf, sizeof(traf), "累计下行: %.2f MB   |   累计上行: %.2f MB   |   不修改任何 Switch 2 系统文件",
+                  rx_bytes / (1024.0 * 1024.0), tx_bytes / (1024.0 * 1024.0));
+    draw_text(st_box.x + 18, st_box.y + 46, traf, COL_MUTED, 2);
+
+    int y = panel.y + 204;
+    const int row_h = 70;
+    if (configs.empty()) {
+        draw_text(panel.x + 36, y + 20,
+                  "未找到 .conf 配置文件！请把 wg.conf 放到 SD 卡 /switch/OunceDesk/wg/ 目录后点击刷新。",
+                  COL_TEXT, 2);
+    }
+    for (size_t i = 0; i < configs.size() && i < 7; ++i) {
+        bool cur = (!active_name.empty() && configs[i] == active_name);
+        std::string lbl = (cur ? "[当前使用] " : "点击启用隧道: ") + configs[i] + ".conf";
+        buttons.push_back({{panel.x + 36, y, pw - 72, row_h - 10}, "wg:use:" + configs[i], lbl, !cur, cur, false});
+        y += row_h;
+    }
+
+    int by = panel.y + ph - 88;
+    buttons.push_back({{panel.x + 36, by, 320, 62}, "wg:off", "关闭 WireGuard 隧道", false, false, true});
+    buttons.push_back({{panel.x + 380, by, 320, 62}, "wg:reload", "刷新配置文件列表", false, false, false});
+    buttons.push_back({{panel.x + 724, by, 360, 62}, "wg:back", "返回", false, true, false});
+
+    for (size_t i = 0; i < buttons.size(); ++i) {
+        draw_button(buttons[i], static_cast<int>(i) == focused_idx);
+    }
     return buttons;
 }
 

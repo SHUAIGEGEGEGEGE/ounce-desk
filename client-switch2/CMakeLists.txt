@@ -17,6 +17,7 @@ set(SOURCES
     source/ui_renderer.cpp
     source/platform_desktop.cpp
     source/platform_switch2.cpp
+    source/wg_tunnel.cpp
 )
 
 add_executable(OunceDesk ${SOURCES})

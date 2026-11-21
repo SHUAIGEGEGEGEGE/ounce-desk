@@ -33,6 +33,9 @@ class TestSourceIntegrity(unittest.TestCase):
             "platform.hpp",
             "platform_switch2.cpp",
             "platform_desktop.cpp",
+            "wg_crypto.hpp",
+            "wg_tunnel.hpp",
+            "wg_tunnel.cpp",
         ]
         for name in expected:
             p = SRC_DIR / name

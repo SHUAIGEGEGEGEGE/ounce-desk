@@ -32,6 +32,14 @@
 
 namespace netc {
 
+// Optional tunnel redirect hook (installed by the built-in WireGuard client). Returns true and fills
+// out_port with a 127.0.0.1 forwarder port when the connection must go through the tunnel.
+using TunnelRedirectFn = bool (*)(const std::string& host, uint16_t port, uint16_t& out_port, std::string& err);
+inline TunnelRedirectFn& tunnel_redirect() {
+    static TunnelRedirectFn fn = nullptr;
+    return fn;
+}
+
 inline void trim(std::string& s) {
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n' || s.back() == '/')) s.pop_back();
     size_t i = 0;
@@ -90,8 +98,23 @@ inline void set_nb(int s, bool nb) {
 }
 
 // Resolve (A + AAAA) and connect with per-address timeout. Returns socket or -1 (err filled).
-inline int tcp_connect(const std::string& host, uint16_t port, int timeout_ms, std::string& err,
+inline int tcp_connect(const std::string& host_in, uint16_t port_in, int timeout_ms, std::string& err,
                        std::string* out_addr = nullptr) {
+    std::string host = host_in;
+    uint16_t port = port_in;
+    if (tunnel_redirect()) {
+        uint16_t lp = 0;
+        std::string terr;
+        if (tunnel_redirect()(host_in, port_in, lp, terr)) {
+            host = "127.0.0.1";
+            port = lp;
+            if (out_addr) *out_addr = "WireGuard→" + host_in;
+            out_addr = nullptr;
+        } else if (!terr.empty()) {
+            err = terr;
+            return -1;
+        }
+    }
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
