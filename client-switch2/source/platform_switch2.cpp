@@ -7,8 +7,6 @@
 #include <sys/stat.h>
 #include <switch.h>
 
-extern "C" void hidSetTouchScreenOutputRanges(u32 width, u32 height) __attribute__((weak));
-
 namespace platform {
 
 namespace {
@@ -38,9 +36,7 @@ bool init() {
     }
 
     // Switch 2 (libounce) supports 1920x1080 native touch output ranges
-    if (hidSetTouchScreenOutputRanges) {
-        hidSetTouchScreenOutputRanges(1920, 1080);
-    }
+    hidSetTouchScreenOutputRanges(1920, 1080);
     hidInitializeTouchScreen();
     hidInitializeKeyboard();
     g_kbd_ok = true;
