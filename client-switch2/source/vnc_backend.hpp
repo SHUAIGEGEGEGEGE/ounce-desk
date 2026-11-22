@@ -74,6 +74,8 @@ private:
 
     z_stream zstream_{};
     bool zstream_ok_ = false;
+    std::vector<uint8_t> zrle_net_buf_;
+    std::vector<uint8_t> zrle_inf_buf_;
     std::vector<uint8_t> zrle_raw_;
     std::vector<uint8_t> rx_cache_;
     size_t rx_pos_ = 0;

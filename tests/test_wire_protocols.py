@@ -62,6 +62,15 @@ class TestSourceIntegrity(unittest.TestCase):
             cleaned = re.sub(r"//.*", "", text)
             self.assertIsNone(bad_re.search(cleaned), f"{p.name} uses exceptions/RTTI incompatible with -fno-exceptions")
 
+    def test_no_large_stack_arrays_for_switch2_pthread_safety(self) -> None:
+        # Horizon OS / libounce std::thread default stack is 128KB; forbid local arrays >= 8192 elements
+        arr_re = re.compile(r"\b(?:uint8_t|int8_t|char|uint16_t|uint32_t|int)\s+\w+\s*\[\s*(\d+)\s*\]")
+        for p in list(SRC_DIR.glob("*.cpp")) + list(SRC_DIR.glob("*.hpp")):
+            text = re.sub(r"//.*", "", p.read_text(encoding="utf-8"))
+            for m in arr_re.finditer(text):
+                n = int(m.group(1))
+                self.assertLess(n, 8192, f"{p.name} allocates [{n}] on stack (risk of Switch 2 pthread stack overflow!): {m.group(0)}")
+
     def test_strictly_ascii_filenames_for_kaihen_compatibility(self) -> None:
         for p in ROOT.rglob("*"):
             if "__pycache__" in p.parts:

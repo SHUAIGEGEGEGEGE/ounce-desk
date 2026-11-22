@@ -1029,15 +1029,15 @@ void Tunnel::run() {
                 ++it;
             }
             // local sockets
+            std::vector<uint8_t> lbuf(16384);
             for (auto& up : S.tcbs) {
                 Tcb& t = *up;
                 if (t.lsock < 0) continue;
                 if (FD_ISSET(t.lsock, &wfds)) flush_to_local(t);
                 if (t.lsock >= 0 && FD_ISSET(t.lsock, &rfds)) {
-                    uint8_t buf[16384];
-                    int n = static_cast<int>(recv(t.lsock, reinterpret_cast<char*>(buf), sizeof(buf), 0));
+                    int n = static_cast<int>(recv(t.lsock, reinterpret_cast<char*>(lbuf.data()), static_cast<int>(lbuf.size()), 0));
                     if (n > 0) {
-                        t.sbuf.insert(t.sbuf.end(), buf, buf + n);
+                        t.sbuf.insert(t.sbuf.end(), lbuf.data(), lbuf.data() + n);
                         tcp_output(t, now);
                     } else if (n == 0) {
                         t.local_eof = true;

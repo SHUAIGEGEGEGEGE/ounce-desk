@@ -481,12 +481,12 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
         return bgra_cpixel_to_rgba(p);
     };
 
+    // IMPORTANT: Keep buffers on heap (never >8KB on stack — Horizon OS pthread stack is 128KB!)
+    if (zrle_net_buf_.size() < 65536) zrle_net_buf_.resize(65536);
+    if (zrle_inf_buf_.size() < 131072) zrle_inf_buf_.resize(131072);
     zrle_raw_.clear();
-    size_t want_cap = static_cast<size_t>(rw) * rh * cpix_sz + 4096;
-    if (zrle_raw_.capacity() < want_cap) zrle_raw_.reserve(want_cap);
+    if (zrle_raw_.capacity() < 524288) zrle_raw_.reserve(524288);
 
-    uint8_t net_buf[65536];
-    uint8_t inf_buf[131072];
     uint32_t zlen_left = zlen;
     size_t pos = 0;
     int cur_ty = ry;
@@ -620,22 +620,26 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
 
     // Stream compressed ZRLE payload in 64KB chunks -> inflate -> live tile decode!
     while (zlen_left > 0) {
-        size_t take = std::min<size_t>(sizeof(net_buf), zlen_left);
-        if (!recv_all(net_buf, take)) return false;
+        size_t take = std::min<size_t>(zrle_net_buf_.size(), zlen_left);
+        if (!recv_all(zrle_net_buf_.data(), take)) return false;
         zlen_left -= static_cast<uint32_t>(take);
 
-        zstream_.next_in = net_buf;
+        zstream_.next_in = zrle_net_buf_.data();
         zstream_.avail_in = static_cast<uInt>(take);
         while (zstream_.avail_in > 0) {
-            zstream_.next_out = inf_buf;
-            zstream_.avail_out = sizeof(inf_buf);
+            zstream_.next_out = zrle_inf_buf_.data();
+            zstream_.avail_out = static_cast<uInt>(zrle_inf_buf_.size());
             int ret = inflate(&zstream_, Z_SYNC_FLUSH);
             if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) return false;
-            size_t have = sizeof(inf_buf) - zstream_.avail_out;
-            if (have > 0) zrle_raw_.insert(zrle_raw_.end(), inf_buf, inf_buf + have);
+            size_t have = zrle_inf_buf_.size() - zstream_.avail_out;
+            if (have > 0) zrle_raw_.insert(zrle_raw_.end(), zrle_inf_buf_.data(), zrle_inf_buf_.data() + have);
             if (ret == Z_BUF_ERROR) break;
         }
         decode_available_tiles(zlen_left == 0);
+        if (pos >= 262144) {
+            zrle_raw_.erase(zrle_raw_.begin(), zrle_raw_.begin() + static_cast<std::ptrdiff_t>(pos));
+            pos = 0;
+        }
     }
     decode_available_tiles(true);
 
