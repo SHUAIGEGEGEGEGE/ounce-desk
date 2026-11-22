@@ -51,17 +51,20 @@ public:
     }
 
     void update_viewport_rect(int win_w, int win_h, int fb_w, int fb_h);
+    bool screen_to_norm(float sx, float sy, float& out_nx, float& out_ny) const;
 
     // Exact 1:1 logical pixel (0..1920, 0..1080) touch handlers (used by native Switch 2 hidGetTouchScreenStates & Desktop SDL)
     // Returns true if 3-finger gesture requests opening the Menu.
-    bool on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBackend& backend);
+    bool on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBackend& backend, bool suppress_direct_click = false);
     void on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBackend& backend, int win_w, int win_h);
-    void on_touch_up(uint64_t finger_id, RemoteBackend& backend);
+    // Returns true iff releasing this finger completed a single-finger primary tap.
+    bool on_touch_up(uint64_t finger_id, RemoteBackend& backend, bool suppress_tap_click = false);
 
     // Handle SDL events while in active STREAMING state
     bool handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_open_swkbd);
 
     void update_frame(float dt_sec, SDL_GameController* pad, RemoteBackend& backend);
+    void sync_pad_buttons(SDL_GameController* pad);
     void send_shortcut(RemoteBackend& backend, ProtocolType proto, const std::string& action);
 
 private:
@@ -85,12 +88,11 @@ private:
     uint32_t prev_phys_mouse_btns_ = 0;
     bool pad_a_down_ = false;
     bool pad_b_down_ = false;
-    bool pad_y_down_ = false;
-    uint64_t pad_y_next_repeat_us_ = 0;
+    bool pad_bs_down_ = false;
+    uint64_t pad_bs_next_repeat_us_ = 0;
     bool pad_zr_down_ = false;
     bool pad_zl_down_ = false;
 
     void send_cursor(RemoteBackend& backend);
-    bool screen_to_norm(float sx, float sy, float& out_nx, float& out_ny) const;
     static void send_combo(RemoteBackend& backend, uint16_t mod_hid, uint8_t mod_mask, uint16_t key_hid);
 };

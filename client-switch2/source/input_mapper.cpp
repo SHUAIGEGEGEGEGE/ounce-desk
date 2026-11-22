@@ -55,7 +55,7 @@ void InputMapper::send_cursor(RemoteBackend& backend) {
     backend.send_mouse_abs(vp_.cursor_x, vp_.cursor_y);
 }
 
-bool InputMapper::on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBackend& backend) {
+bool InputMapper::on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBackend& backend, bool suppress_direct_click) {
     fingers_[finger_id] = {sx, sy, sx, sy, platform::now_us(), false};
     if (fingers_.size() >= 3) {
         if (direct_dragging_) {
@@ -85,8 +85,10 @@ bool InputMapper::on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBa
             vp_.cursor_x = nx;
             vp_.cursor_y = ny;
             send_cursor(backend);
-            backend.send_mouse_button(MouseBtn::LEFT, true);
-            direct_dragging_ = true;
+            if (!suppress_direct_click) {
+                backend.send_mouse_button(MouseBtn::LEFT, true);
+                direct_dragging_ = true;
+            }
         }
     }
     return false;
@@ -99,7 +101,7 @@ void InputMapper::on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBa
     float dy = sy - it->second.y;
     it->second.x = sx;
     it->second.y = sy;
-    if (std::hypot(sx - it->second.start_x, sy - it->second.start_y) > 14.0f) {
+    if (std::hypot(sx - it->second.start_x, sy - it->second.start_y) > 18.0f) {
         it->second.moved = true;
     }
 
@@ -136,7 +138,11 @@ void InputMapper::on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBa
             vp_.cursor_x += (dx * accel * sensitivity_) / static_cast<float>(std::max(1, vp_.dst_rect.w));
             vp_.cursor_y += (dy * accel * sensitivity_) / static_cast<float>(std::max(1, vp_.dst_rect.h));
             send_cursor(backend);
-        } else if (direct_dragging_) {
+        } else if (touch_mode_ == TouchMode::TOUCH && (direct_dragging_ || it->second.moved)) {
+            if (!direct_dragging_) {
+                backend.send_mouse_button(MouseBtn::LEFT, true);
+                direct_dragging_ = true;
+            }
             // Exact 1:1 direct touch drag
             float nx, ny;
             if (screen_to_norm(sx, sy, nx, ny)) {
@@ -148,11 +154,12 @@ void InputMapper::on_touch_move(uint64_t finger_id, float sx, float sy, RemoteBa
     }
 }
 
-void InputMapper::on_touch_up(uint64_t finger_id, RemoteBackend& backend) {
+bool InputMapper::on_touch_up(uint64_t finger_id, RemoteBackend& backend, bool suppress_tap_click) {
+    bool primary_tap = false;
     auto it = fingers_.find(finger_id);
     if (it != fingers_.end()) {
         uint64_t held_us = platform::now_us() - it->second.down_us;
-        bool was_tap = !it->second.moved && held_us < 280000ULL;
+        bool was_tap = !it->second.moved && held_us < 380000ULL;
         if (direct_dragging_) {
             backend.send_mouse_button(MouseBtn::LEFT, false);
             direct_dragging_ = false;
@@ -162,12 +169,18 @@ void InputMapper::on_touch_up(uint64_t finger_id, RemoteBackend& backend) {
             backend.send_mouse_button(MouseBtn::RIGHT, false);
         } else if (!two_finger_gesture_ && fingers_.size() == 1 && touch_mode_ == TouchMode::MOUSE && was_tap) {
             // 1-finger tap in Mouse mode = Left Click
-            backend.send_mouse_button(MouseBtn::LEFT, true);
-            backend.send_mouse_button(MouseBtn::LEFT, false);
+            if (!suppress_tap_click) {
+                backend.send_mouse_button(MouseBtn::LEFT, true);
+                backend.send_mouse_button(MouseBtn::LEFT, false);
+            }
+        }
+        if (!two_finger_gesture_ && fingers_.size() == 1 && was_tap) {
+            primary_tap = true;
         }
         fingers_.erase(it);
     }
     if (fingers_.empty()) two_finger_gesture_ = false;
+    return primary_tap;
 }
 
 bool InputMapper::handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_open_swkbd) {
@@ -237,8 +250,16 @@ bool InputMapper::handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, 
             break;
         }
         case SDL_CONTROLLERBUTTONDOWN: {
+            // Note on Switch 2 SDL_GameController layout (Xbox positional):
+            //   Physical Y (Left)   = SDL_CONTROLLER_BUTTON_X -> Backspace (handled in update_frame)
+            //   Physical X (Top)    = SDL_CONTROLLER_BUTTON_Y -> Manual keyboard shortcut
+            //   Physical B (Bottom) = SDL_CONTROLLER_BUTTON_A -> Left click / 2nd press on input box opens keyboard
+            //   Physical A (Right)  = SDL_CONTROLLER_BUTTON_B -> Right click
+            const auto kbd_btn = platform::is_switch_hardware()
+                                     ? SDL_CONTROLLER_BUTTON_Y
+                                     : SDL_CONTROLLER_BUTTON_X;
             if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) toggle_touch_mode();
-            else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_X) out_open_swkbd = true;
+            else if (ev.cbutton.button == kbd_btn) out_open_swkbd = true;
             else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) backend.send_key(82, true, 0);
             else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) backend.send_key(81, true, 0);
             else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT) backend.send_key(80, true, 0);
@@ -304,9 +325,12 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
         if (wx != 0 || wy != 0) backend.send_mouse_wheel(wx, wy);
     }
 
+    const auto bs_btn = platform::is_switch_hardware()
+                            ? SDL_CONTROLLER_BUTTON_X   // Physical Y (Left) on Switch 2!
+                            : SDL_CONTROLLER_BUTTON_Y;
     bool a_now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     bool b_now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
-    bool y_now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
+    bool bs_now = SDL_GameControllerGetButton(pad, bs_btn) != 0;
     bool zr_now = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000;
     bool zl_now = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000;
 
@@ -316,21 +340,36 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
     if ((b_now || zl_now) != (pad_b_down_ || pad_zl_down_)) {
         backend.send_mouse_button(MouseBtn::RIGHT, b_now || zl_now);
     }
-    if (y_now != pad_y_down_) {
-        // Y button = Backspace (HID 42) so user can easily delete existing characters in remote inputs!
-        backend.send_key(42, y_now, 0);
-        if (y_now) {
-            pad_y_next_repeat_us_ = platform::now_us() + 420000ULL;
+    if (bs_now != pad_bs_down_) {
+        // Physical Y on Switch 2 = Backspace (HID 42)
+        backend.send_key(42, bs_now, 0);
+        if (bs_now) {
+            pad_bs_next_repeat_us_ = platform::now_us() + 420000ULL;
         }
-    } else if (y_now && platform::now_us() >= pad_y_next_repeat_us_) {
+    } else if (bs_now && platform::now_us() >= pad_bs_next_repeat_us_) {
         // Hold Y to continuously delete characters
         backend.send_key(42, false, 0);
         backend.send_key(42, true, 0);
-        pad_y_next_repeat_us_ = platform::now_us() + 75000ULL;
+        pad_bs_next_repeat_us_ = platform::now_us() + 75000ULL;
     }
 
-    pad_a_down_ = a_now; pad_b_down_ = b_now; pad_y_down_ = y_now;
+    pad_a_down_ = a_now; pad_b_down_ = b_now; pad_bs_down_ = bs_now;
     pad_zr_down_ = zr_now; pad_zl_down_ = zl_now;
+}
+
+void InputMapper::sync_pad_buttons(SDL_GameController* pad) {
+    if (!pad) {
+        pad_a_down_ = pad_b_down_ = pad_bs_down_ = pad_zr_down_ = pad_zl_down_ = false;
+        return;
+    }
+    const auto bs_btn = platform::is_switch_hardware()
+                            ? SDL_CONTROLLER_BUTTON_X
+                            : SDL_CONTROLLER_BUTTON_Y;
+    pad_a_down_ = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    pad_b_down_ = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    pad_bs_down_ = SDL_GameControllerGetButton(pad, bs_btn) != 0;
+    pad_zr_down_ = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000;
+    pad_zl_down_ = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000;
 }
 
 void InputMapper::send_combo(RemoteBackend& backend, uint16_t mod_hid, uint8_t mod_mask, uint16_t key_hid) {
@@ -348,12 +387,7 @@ void InputMapper::send_shortcut(RemoteBackend& backend, ProtocolType proto, cons
     if (action == "copy") send_combo(backend, primary_mod, primary_mask, 6);
     else if (action == "paste") send_combo(backend, primary_mod, primary_mask, 25);
     else if (action == "undo") send_combo(backend, primary_mod, primary_mask, 29);
-    else if (action == "clear_all") {
-        // Select All (Ctrl+A / Cmd+A) -> Backspace (HID 42)
-        send_combo(backend, primary_mod, primary_mask, 4);
-        backend.send_key(42, true, 0);
-        backend.send_key(42, false, 0);
-    } else if (action == "switch_app") {
+    else if (action == "switch_app") {
         if (is_mac) send_combo(backend, 227, RD_MOD_LMETA, 43);
         else send_combo(backend, 226, RD_MOD_LALT, 43);
     } else if (action == "launcher") {

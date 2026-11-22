@@ -1,6 +1,5 @@
 #include "backend.hpp"
 #include "input_mapper.hpp"
-#include "keymap.hpp"
 #include "platform.hpp"
 #include "profiles.hpp"
 #include "rdp_backend.hpp"
@@ -16,6 +15,7 @@
 
 #include <SDL2/SDL.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -117,18 +117,17 @@ int main(int argc, char* argv[]) {
     // Previous frame native Switch 2 touch points for exact DOWN/MOVE/UP synthesis
     std::map<uint32_t, platform::NativeTouchPoint> prev_native_touches;
 
-    // Auto Switch 2 keyboard: tap on a remote text box (cursor turns into I-beam) -> open swkbd;
-    // tap on blank area (normal arrow cursor) -> nothing / cancel.
+    // Two-step input box interaction:
+    //   1st B press or screen tap -> ONLY inserts caret (so Y Backspace works cleanly!)
+    //   2nd B press or screen tap on the SAME input box -> opens Switch 2 native keyboard (ONLY in input boxes!)
     bool auto_ime = true;
-    uint64_t ime_check_at_us = 0;
-    uint64_t tap_down_us = 0;
-    float tap_x0 = 0.0f, tap_y0 = 0.0f;
-    float tap_max_dist = 0.0f;
-    bool tap_tracking = false;
-    float last_tap_x = 960.0f, last_tap_y = 540.0f;
-    std::string remote_typed_buf;
-    float remote_typed_nx = -10.0f;
-    float remote_typed_ny = -10.0f;
+    bool caret_placed = false;
+    float caret_nx = -10.0f;
+    float caret_ny = -10.0f;
+    uint64_t caret_placed_us = 0;
+    uint64_t ime_open_check_at_us = 0;
+    bool b_click_pending_arm = false;
+    bool suppress_touch_click = false;
 
     // Saved-device manager (home menu) + WireGuard manager + sensitivity slider + macOS keyboard bubble state
     bool show_manage = false;
@@ -171,7 +170,7 @@ int main(int argc, char* argv[]) {
     auto save_settings = [&]() {
         FILE* f = std::fopen(settings_path.c_str(), "w");
         if (!f) return;
-        std::fprintf(f, "sensitivity=%.2f\nauto_ime=%d\ntouch_mode=%d\nwg_config=%s\n",
+        std::fprintf(f, "sensitivity=%.2f\ntap2_ime=%d\ntouch_mode=%d\nwg_config=%s\n",
                      input.sensitivity(), auto_ime ? 1 : 0,
                      input.touch_mode() == TouchMode::MOUSE ? 1 : 0,
                      saved_wg_name.c_str());
@@ -186,7 +185,7 @@ int main(int argc, char* argv[]) {
                 int iv = 0;
                 char sv[128]{};
                 if (std::sscanf(line, "sensitivity=%f", &fv) == 1) input.set_sensitivity(fv);
-                else if (std::sscanf(line, "auto_ime=%d", &iv) == 1) auto_ime = (iv != 0);
+                else if (std::sscanf(line, "tap2_ime=%d", &iv) == 1) auto_ime = (iv != 0);
                 else if (std::sscanf(line, "touch_mode=%d", &iv) == 1) input.set_touch_mode(iv ? TouchMode::MOUSE : TouchMode::TOUCH);
                 else if (std::sscanf(line, "wg_config=%127s", sv) == 1) saved_wg_name = sv;
             }
@@ -250,9 +249,10 @@ int main(int argc, char* argv[]) {
         if (active_profile.name.empty()) {
             active_profile.name = active_profile.host;
         }
-        remote_typed_buf.clear();
-        remote_typed_nx = -10.0f;
-        remote_typed_ny = -10.0f;
+        caret_placed = false;
+        ime_open_check_at_us = 0;
+        b_click_pending_arm = false;
+        suppress_touch_click = false;
         if (also_save) {
             profiles.add_or_update(active_profile, profiles_path);
         }
@@ -324,92 +324,64 @@ int main(int argc, char* argv[]) {
 
     uint64_t last_us = platform::now_us();
 
-    auto utf8_codepoint_len = [](const std::string& s) -> size_t {
-        size_t pos = 0, cnt = 0;
-        while (pos < s.size()) {
-            if (keymap::next_utf8_codepoint(s.data(), s.size(), pos) == 0) break;
-            ++cnt;
+    auto is_remote_input_box = [&](float nx, float ny) -> bool {
+        if (!backend) return false;
+        if (backend->cursor_is_text()) return true;
+        if (backend->protocol() == ProtocolType::VNC_MACOS || !backend->cursor_shape_known()) {
+            return backend->detect_text_focus_near(nx, ny);
         }
-        return cnt;
+        return false;
     };
 
-    auto current_remote_norm = [&](float& out_nx, float& out_ny) {
-        const auto& vp = input.viewport();
-        out_nx = vp.cursor_x;
-        out_ny = vp.cursor_y;
-        if (input.touch_mode() == TouchMode::TOUCH && vp.dst_rect.w > 0 && vp.dst_rect.h > 0) {
-            out_nx = (last_tap_x - static_cast<float>(vp.dst_rect.x)) / static_cast<float>(vp.dst_rect.w);
-            out_ny = (last_tap_y - static_cast<float>(vp.dst_rect.y)) / static_cast<float>(vp.dst_rect.h);
-        }
+    auto is_same_input_spot = [&](float nx, float ny) -> bool {
+        return caret_placed &&
+               std::fabs(nx - caret_nx) <= 0.08f &&
+               std::fabs(ny - caret_ny) <= 0.038f;
     };
 
     auto open_streaming_swkbd = [&]() {
         if (!backend) return;
-        float nx = 0.5f, ny = 0.5f;
-        current_remote_norm(nx, ny);
-        float dx = nx - remote_typed_nx;
-        float dy = ny - remote_typed_ny;
-        // Same input box if within ~12% horizontal and ~5% vertical of where we last typed
-        bool same_field = (!remote_typed_buf.empty() && (dx * dx < 0.12f * 0.12f) && (dy * dy < 0.05f * 0.05f));
-
-        // Prepend 24 Zero-Width Spaces (U+200B, 3 bytes each: E2 80 8B) BEFORE the remembered text:
-        //  - Visually 0-width invisible in Switch 2's nintendo_udsg system font!
-        //  - Gives the user 24 Backspace presses even when the remote input box already had characters not typed by us!
-        constexpr const char* ZWS = "\xE2\x80\x8B";
-        constexpr size_t ANCHOR_COUNT = 24;
-        std::string seed;
-        seed.reserve(ANCHOR_COUNT * 3 + remote_typed_buf.size());
-        for (size_t i = 0; i < ANCHOR_COUNT; ++i) seed.append(ZWS);
-        if (same_field) seed.append(remote_typed_buf);
-
+        caret_placed = false;
+        ime_open_check_at_us = 0;
+        b_click_pending_arm = false;
+        suppress_touch_click = false;
         std::string typed;
-        if (platform::show_system_keyboard("输入或删除文字 (按退格可删远程已有内容)", seed, typed, false, false)) {
-            // Count how many leading U+200B anchors remain
-            size_t anchors_left = 0;
-            size_t scan = 0;
-            while (scan + 3 <= typed.size() &&
-                   static_cast<uint8_t>(typed[scan]) == 0xE2 &&
-                   static_cast<uint8_t>(typed[scan + 1]) == 0x80 &&
-                   static_cast<uint8_t>(typed[scan + 2]) == 0x8B) {
-                ++anchors_left;
-                scan += 3;
+        if (platform::show_system_keyboard("输入文字", "", typed, false, false)) {
+            if (!typed.empty()) {
+                backend->send_text_utf8(typed);
             }
-            // Strip ALL U+200B anchors anywhere in the returned text
-            std::string clean;
-            clean.reserve(typed.size());
-            for (size_t i = 0; i < typed.size();) {
-                if (i + 3 <= typed.size() &&
-                    static_cast<uint8_t>(typed[i]) == 0xE2 &&
-                    static_cast<uint8_t>(typed[i + 1]) == 0x80 &&
-                    static_cast<uint8_t>(typed[i + 2]) == 0x8B) {
-                    i += 3;
-                } else {
-                    clean.push_back(typed[i++]);
-                }
-            }
-
-            size_t old_chars = same_field ? utf8_codepoint_len(remote_typed_buf) : 0;
-            size_t extra_bs = (anchors_left < ANCHOR_COUNT) ? (ANCHOR_COUNT - anchors_left) : 0;
-            size_t total_bs = old_chars + extra_bs;
-
-            for (size_t i = 0; i < total_bs; ++i) {
-                backend->send_key(42, true, 0);   // HID 42 = Backspace
-                backend->send_key(42, false, 0);
-            }
-            if (!clean.empty()) {
-                backend->send_text_utf8(clean);
-            }
-            remote_typed_buf = clean;
-            remote_typed_nx = nx;
-            remote_typed_ny = ny;
         } else if (!platform::is_switch_hardware()) {
             // Only fall back to built-in OSK on Desktop PCs that have no system keyboard applet!
-            // On Switch 2, pressing B / Cancel simply closes the native keyboard cleanly.
             show_osk = true;
         }
+        input.sync_pad_buttons(pad);
         prev_native_touches.clear();
         touch_block = true;
         last_us = platform::now_us();
+    };
+
+    auto handle_primary_activate = [&](float nx, float ny, uint64_t click_us) {
+        if (!auto_ime || !backend || mode != AppMode::STREAMING || show_overlay || show_osk) return;
+        if (!is_same_input_spot(nx, ny)) {
+            // 1st B press or 1st screen tap: ONLY insert caret, never pop up keyboard!
+            caret_placed = true;
+            caret_nx = nx;
+            caret_ny = ny;
+            caret_placed_us = click_us;
+            ime_open_check_at_us = 0;
+        } else {
+            // 2nd B press or 2nd screen tap on the SAME spot: open native keyboard ONLY if inside an input box!
+            if (is_remote_input_box(nx, ny)) {
+                open_streaming_swkbd();
+            } else if (click_us - caret_placed_us < 450000ULL) {
+                // Fast double-click/tap before remote I-beam PDU arrived: verify once after 220ms
+                ime_open_check_at_us = click_us + 220000ULL;
+            } else {
+                caret_nx = nx;
+                caret_ny = ny;
+                caret_placed_us = click_us;
+            }
+        }
     };
 
     auto handle_home_menu_action = [&](const std::string& id) {
@@ -674,33 +646,37 @@ int main(int argc, char* argv[]) {
                     int tx = static_cast<int>(kv.second.x);
                     int ty = static_cast<int>(kv.second.y);
                     if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
-                        if (cur_map.size() == 1 && prev_native_touches.empty()) {
-                            tap_tracking = true;
-                            tap_down_us = now;
-                            tap_x0 = kv.second.x;
-                            tap_y0 = kv.second.y;
-                            tap_max_dist = 0.0f;
-                        } else {
-                            tap_tracking = false;  // multi-finger gesture: never a text-box tap
-                        }
                         if (UIRenderer::hit_test(menu_pill, tx, ty)) {
-                            tap_tracking = false;
+                            suppress_touch_click = false;
                             show_overlay = true;
                             overlay_focus = 0;
-                        } else if (input.on_touch_down(kv.first, kv.second.x, kv.second.y, *backend)) {
-                            tap_tracking = false;
-                            show_overlay = true;
-                            overlay_focus = 0;
+                        } else {
+                            bool suppress = false;
+                            if (cur_map.size() == 1 && prev_native_touches.empty() && auto_ime) {
+                                float tnx = input.viewport().cursor_x;
+                                float tny = input.viewport().cursor_y;
+                                if (input.touch_mode() == TouchMode::TOUCH) {
+                                    input.screen_to_norm(kv.second.x, kv.second.y, tnx, tny);
+                                }
+                                // Fast 2nd tap on an already-verified input box: suppress redundant 2nd click
+                                // so Windows/Mac won't double-click-select existing text!
+                                if (is_same_input_spot(tnx, tny) && is_remote_input_box(tnx, tny) &&
+                                    (now - caret_placed_us < 550000ULL)) {
+                                    suppress = true;
+                                }
+                            }
+                            suppress_touch_click = suppress;
+                            if (input.on_touch_down(kv.first, kv.second.x, kv.second.y, *backend, suppress)) {
+                                suppress_touch_click = false;
+                                show_overlay = true;
+                                overlay_focus = 0;
+                            }
                         }
                     } else {
                         dispatch_ui_tap(tx, ty);
                     }
                 } else if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
                     // Existing finger moved (MOVE)
-                    if (tap_tracking) {
-                        float dx = kv.second.x - tap_x0, dy = kv.second.y - tap_y0;
-                        tap_max_dist = std::max(tap_max_dist, dx * dx + dy * dy);
-                    }
                     input.on_touch_move(kv.first, kv.second.x, kv.second.y, *backend, LOGICAL_W, LOGICAL_H);
                 } else if (slider_dragging && (show_home_menu || show_overlay)) {
                     // Drag the mouse sensitivity slider knob
@@ -715,15 +691,10 @@ int main(int argc, char* argv[]) {
             for (const auto& kv : prev_native_touches) {
                 if (cur_map.find(kv.first) == cur_map.end()) {
                     if (mode == AppMode::STREAMING && backend) {
-                        input.on_touch_up(kv.first, *backend);
-                        if (tap_tracking && cur_map.empty()) {
-                            // Short, still, single-finger tap -> check remote cursor shape shortly after click
-                            if (now - tap_down_us < 450000ULL && tap_max_dist < 40.0f * 40.0f) {
-                                ime_check_at_us = now + 320000ULL;
-                                last_tap_x = tap_x0;
-                                last_tap_y = tap_y0;
-                            }
-                            tap_tracking = false;
+                        bool was_primary_tap = input.on_touch_up(kv.first, *backend, suppress_touch_click);
+                        suppress_touch_click = false;
+                        if (was_primary_tap && cur_map.empty() && !show_overlay && !show_osk) {
+                            handle_primary_activate(input.viewport().cursor_x, input.viewport().cursor_y, now);
                         }
                     }
                 }
@@ -934,6 +905,18 @@ int main(int argc, char* argv[]) {
                         overlay_focus = 0;
                         continue;
                     }
+                    // Physical B on Switch 2 = SDL_CONTROLLER_BUTTON_A:
+                    //   1st press -> Left Click (inserts caret)
+                    //   2nd press on the same input box -> opens Switch 2 native keyboard without double-selecting text!
+                    if (ev.type == SDL_CONTROLLERBUTTONDOWN && ev.cbutton.button == SDL_CONTROLLER_BUTTON_A) {
+                        float cnx = input.viewport().cursor_x;
+                        float cny = input.viewport().cursor_y;
+                        if (auto_ime && is_same_input_spot(cnx, cny) && is_remote_input_box(cnx, cny)) {
+                            open_streaming_swkbd();
+                            continue;
+                        }
+                        b_click_pending_arm = true;
+                    }
                     bool open_swkbd = false;
                     if (input.handle_sdl_event(ev, *backend, LOGICAL_W, LOGICAL_H, open_swkbd)) {
                         show_overlay = true;
@@ -942,15 +925,15 @@ int main(int argc, char* argv[]) {
                     if (open_swkbd) {
                         open_streaming_swkbd();
                     }
-                    // Desktop build: left click release also triggers the text-box check
+                    // Desktop build: left click release also uses the two-step input box logic
                     if (!platform::uses_native_touch() && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
-                        ime_check_at_us = platform::now_us() + 320000ULL;
-                        last_tap_x = static_cast<float>(ev.button.x);
-                        last_tap_y = static_cast<float>(ev.button.y);
+                        handle_primary_activate(input.viewport().cursor_x, input.viewport().cursor_y, platform::now_us());
                     }
-                    // Gamepad A (left click) also triggers the text-box check in mouse mode
                     if (ev.type == SDL_CONTROLLERBUTTONUP && ev.cbutton.button == SDL_CONTROLLER_BUTTON_A) {
-                        ime_check_at_us = platform::now_us() + 320000ULL;
+                        if (b_click_pending_arm) {
+                            b_click_pending_arm = false;
+                            handle_primary_activate(input.viewport().cursor_x, input.viewport().cursor_y, platform::now_us());
+                        }
                     }
                 }
             }
@@ -960,25 +943,15 @@ int main(int argc, char* argv[]) {
             input.update_frame(dt, pad, *backend);
         }
 
-        // Auto-open Switch 2 native keyboard when the tap landed on a remote text input (I-beam cursor or macOS text caret/box)
-        if (ime_check_at_us != 0 && platform::now_us() >= ime_check_at_us) {
-            ime_check_at_us = 0;
-            if (auto_ime && mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
-                bool is_text_target = backend->cursor_is_text();
-                if (!is_text_target && (backend->protocol() == ProtocolType::VNC_MACOS || !backend->cursor_shape_known())) {
-                    // Compute normalized remote coordinates of the tap / cursor and inspect framebuffer for caret or input box
-                    const auto& vp = input.viewport();
-                    float nx = vp.cursor_x;
-                    float ny = vp.cursor_y;
-                    if (input.touch_mode() == TouchMode::TOUCH && vp.dst_rect.w > 0 && vp.dst_rect.h > 0) {
-                        nx = (last_tap_x - static_cast<float>(vp.dst_rect.x)) / static_cast<float>(vp.dst_rect.w);
-                        ny = (last_tap_y - static_cast<float>(vp.dst_rect.y)) / static_cast<float>(vp.dst_rect.h);
-                    }
-                    is_text_target = backend->detect_text_focus_near(nx, ny);
-                }
-                if (is_text_target) {
-                    platform::log_line("[UI] Tap on remote text field -> opening native keyboard directly");
+        // Deferred verification for fast double-click/tap (<450ms) when remote I-beam PDU was still in flight:
+        // opens native keyboard ONLY if the clicked spot actually turned into an input box!
+        if (ime_open_check_at_us != 0 && platform::now_us() >= ime_open_check_at_us) {
+            ime_open_check_at_us = 0;
+            if (auto_ime && caret_placed && mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
+                if (is_remote_input_box(caret_nx, caret_ny)) {
                     open_streaming_swkbd();
+                } else {
+                    caret_placed = false;
                 }
             }
         }
