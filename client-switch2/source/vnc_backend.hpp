@@ -53,13 +53,20 @@ private:
     uint8_t btn_mask_ = 0;
     uint16_t last_x_ = 0;
     uint16_t last_y_ = 0;
+    uint16_t sent_x_ = 0xFFFF;
+    uint16_t sent_y_ = 0xFFFF;
+    uint8_t sent_mask_ = 0xFF;
+    uint64_t last_ptr_send_us_ = 0;
 
     int fb_w_ = 0;
     int fb_h_ = 0;
+    int disp_scale_ = 1;
+    int disp_w_ = 0;
+    int disp_h_ = 0;
     uint8_t vnc_bpp_ = 16;
-    uint32_t lut8_[256]{};
     std::vector<uint32_t> lut16_;
     std::vector<uint32_t> fb_rgba_;
+    std::vector<uint32_t> disp_rgba_;
     std::vector<DirtyRect> dirty_rects_;
     bool full_dirty_ = false;
     bool has_any_pixels_ = false;
@@ -67,6 +74,7 @@ private:
 
     z_stream zstream_{};
     bool zstream_ok_ = false;
+    std::vector<uint8_t> zrle_raw_;
     std::vector<uint8_t> rx_cache_;
     size_t rx_pos_ = 0;
     size_t rx_len_ = 0;
@@ -79,7 +87,6 @@ private:
     void set_status(const std::string& s);
     void set_error(const std::string& e);
     void send_fb_update_request(bool incremental);
-    void send_fb_region_request(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool incremental);
     void send_pointer(uint16_t x, uint16_t y, uint8_t mask);
     void send_keysym(uint32_t keysym, bool pressed);
 

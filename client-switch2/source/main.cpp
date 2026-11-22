@@ -319,9 +319,7 @@ int main(int argc, char* argv[]) {
             }
         } else if (field_idx == 6) {
             if (draft.protocol == ProtocolType::VNC_MACOS) {
-                if (draft.vnc_bpp == 16) draft.vnc_bpp = 8;
-                else if (draft.vnc_bpp == 8) draft.vnc_bpp = 32;
-                else draft.vnc_bpp = 16;
+                draft.vnc_bpp = (draft.vnc_bpp == 32) ? 16 : 32;
             } else {
                 if (draft.req_width == 1920) { draft.req_width = 1280; draft.req_height = 720; }
                 else { draft.req_width = 1920; draft.req_height = 1080; }

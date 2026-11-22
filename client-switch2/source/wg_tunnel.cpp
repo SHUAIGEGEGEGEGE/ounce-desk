@@ -48,8 +48,8 @@ constexpr uint64_t REJECT_AFTER_US = 180ULL * 1000000ULL;
 constexpr uint64_t REKEY_TIMEOUT_US = 5ULL * 1000000ULL;
 constexpr size_t SNDBUF_MAX = 512 * 1024;
 constexpr size_t RCV_WINDOW_UNSCALED = 65535;
-constexpr uint8_t RCV_WSCALE_OFFER = 4;                  // 16x scale -> 512 KB receive window
-constexpr size_t RCV_WINDOW_SCALED = 512 * 1024;
+constexpr uint8_t RCV_WSCALE_OFFER = 5;                  // 32x scale -> 1.5 MB receive window
+constexpr size_t RCV_WINDOW_SCALED = 1536 * 1024;
 
 const char* CONSTRUCTION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const char* IDENTIFIER = "WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -222,7 +222,7 @@ struct Keypair {
     uint8_t recv_key[32]{};
     uint64_t send_ctr = 0;
     uint64_t recv_max = 0;
-    uint64_t recv_bitmap = 0;
+    uint64_t recv_bitmap[32]{};  // 2048-packet anti-replay window (prevents false drops on 4K/5K bursts!)
     uint64_t created_us = 0;
 };
 
@@ -254,6 +254,7 @@ struct Tcb {
     uint8_t snd_wscale = 0;
     uint8_t unacked_segs = 0;
     bool ack_pending = false;
+    bool sack_ok = false;
 };
 
 struct Forward {
@@ -526,7 +527,23 @@ void Tunnel::run() {
     };
 
     auto tcp_emit = [&](Tcb& t, uint32_t seq, const uint8_t* data, size_t len, uint8_t flags) {
-        size_t opt = (flags & 0x02) ? 8 : 0;  // MSS (4B) + NOP (1B) + WSOPT (3B)
+        struct SackBlk { uint32_t l, r; };
+        SackBlk sblks[3]{};
+        int nsack = 0;
+        if (!(flags & 0x02) && (flags & 0x10) && len == 0 && t.sack_ok && !t.ooo.empty()) {
+            for (const auto& kv : t.ooo) {
+                uint32_t s = kv.first;
+                uint32_t e = s + static_cast<uint32_t>(kv.second.size());
+                if (nsack > 0 && seq_le(s, sblks[nsack - 1].r)) {
+                    if (seq_gt(e, sblks[nsack - 1].r)) sblks[nsack - 1].r = e;
+                } else if (nsack < 3) {
+                    sblks[nsack++] = {s, e};
+                }
+            }
+        }
+        // SYN options: MSS(4) + SACK-Permitted(2) + WSOPT(3) + 3xNOP(3) = 12 bytes
+        // SACK ACK options: 2xNOP(2) + SACK hdr(2) + nsack*8 = 4 + nsack*8 bytes
+        size_t opt = (flags & 0x02) ? 12 : (nsack > 0 ? static_cast<size_t>(4 + nsack * 8) : 0);
         size_t tcp_len = 20 + opt + len;
         std::vector<uint8_t> pkt(20 + tcp_len, 0);
         uint8_t* ip = pkt.data();
@@ -558,11 +575,19 @@ void Tunnel::run() {
             t.last_wnd_bytes = 65535;
         }
         be16w(tcp + 14, wnd);
-        if (opt) {
+        if (flags & 0x02) {
             tcp[20] = 2; tcp[21] = 4;
             be16w(tcp + 22, static_cast<uint16_t>(S.cfg.mtu - 40 - 20));  // MSS
-            tcp[24] = 1;                                                   // NOP
-            tcp[25] = 3; tcp[26] = 3; tcp[27] = RCV_WSCALE_OFFER;          // RFC 7323 Window Scale
+            tcp[24] = 4; tcp[25] = 2;                                      // RFC 2018 SACK-Permitted
+            tcp[26] = 3; tcp[27] = 3; tcp[28] = RCV_WSCALE_OFFER;          // RFC 7323 Window Scale
+            tcp[29] = 1; tcp[30] = 1; tcp[31] = 1;                         // NOP padding
+        } else if (nsack > 0) {
+            tcp[20] = 1; tcp[21] = 1;                                      // NOP, NOP
+            tcp[22] = 5; tcp[23] = static_cast<uint8_t>(2 + nsack * 8);    // RFC 2018 SACK blocks
+            for (int i = 0; i < nsack; ++i) {
+                be32w(tcp + 24 + i * 8, sblks[i].l);
+                be32w(tcp + 28 + i * 8, sblks[i].r);
+            }
         }
         if (flags & 0x10) {
             t.ack_pending = false;
@@ -679,6 +704,8 @@ void Tunnel::run() {
                     } else if (kind == 3 && l == 3) {
                         t.snd_wscale = std::min<uint8_t>(tcp[o + 2], 14);
                         t.rcv_wscale = RCV_WSCALE_OFFER;
+                    } else if (kind == 4 && l == 2) {
+                        t.sack_ok = true;
                     }
                     o += l;
                 }
@@ -774,21 +801,39 @@ void Tunnel::run() {
         tcp_output(t, now);
     };
 
-    // ---- WG receive
+    // ---- WG receive (2048-packet anti-replay window matching Linux kernel WireGuard)
     auto replay_ok = [](Keypair& kp, uint64_t ctr) {
         if (ctr > kp.recv_max) return true;
         uint64_t d = kp.recv_max - ctr;
-        if (d >= 64) return false;
-        return (kp.recv_bitmap & (1ULL << d)) == 0;
+        if (d >= 2048) return false;
+        return (kp.recv_bitmap[d >> 6] & (1ULL << (d & 63))) == 0;
     };
     auto replay_mark = [](Keypair& kp, uint64_t ctr) {
         if (ctr > kp.recv_max) {
             uint64_t sh = ctr - kp.recv_max;
-            kp.recv_bitmap = (sh >= 64) ? 0 : (kp.recv_bitmap << sh);
-            kp.recv_bitmap |= 1;
+            if (sh >= 2048) {
+                std::memset(kp.recv_bitmap, 0, sizeof(kp.recv_bitmap));
+            } else {
+                uint64_t word_sh = sh >> 6;
+                uint64_t bit_sh = sh & 63;
+                if (word_sh > 0) {
+                    for (int i = 31; i >= static_cast<int>(word_sh); --i) {
+                        kp.recv_bitmap[i] = kp.recv_bitmap[i - word_sh];
+                    }
+                    for (uint64_t i = 0; i < word_sh; ++i) kp.recv_bitmap[i] = 0;
+                }
+                if (bit_sh > 0) {
+                    for (int i = 31; i > 0; --i) {
+                        kp.recv_bitmap[i] = (kp.recv_bitmap[i] << bit_sh) | (kp.recv_bitmap[i - 1] >> (64 - bit_sh));
+                    }
+                    kp.recv_bitmap[0] <<= bit_sh;
+                }
+            }
+            kp.recv_bitmap[0] |= 1ULL;
             kp.recv_max = ctr;
         } else {
-            kp.recv_bitmap |= 1ULL << (kp.recv_max - ctr);
+            uint64_t d = kp.recv_max - ctr;
+            if (d < 2048) kp.recv_bitmap[d >> 6] |= (1ULL << (d & 63));
         }
     };
 

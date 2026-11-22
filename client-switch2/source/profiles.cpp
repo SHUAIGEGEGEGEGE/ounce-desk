@@ -151,7 +151,8 @@ void ProfileManager::load(const std::string& path) {
             }
             if (fields.size() >= 10) {
                 int bpp = std::atoi(fields[9].c_str());
-                if (bpp == 8 || bpp == 16 || bpp == 32) p.vnc_bpp = static_cast<uint8_t>(bpp);
+                // macOS screensharingd supports 16-bit (RGB555) and 32-bit (BGRA); coerce legacy 8 -> 16!
+                p.vnc_bpp = (bpp == 32) ? 32 : 16;
             }
             p.from_mdns = false;
             saved_.push_back(p);

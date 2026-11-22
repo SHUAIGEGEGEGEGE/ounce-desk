@@ -570,9 +570,9 @@ std::vector<UIButton> UIRenderer::render_connect_form(
         {"f:pass",  "密码", draft.password.empty() ? "(点击输入登录密码)" : std::string(draft.password.size(), '*')},
     };
     if (is_mac) {
-        std::string qlabel = "流畅高速 (16位色 · 推荐 4K/5K 高分屏共享)";
-        if (draft.vnc_bpp == 8) qlabel = "极速秒开 (8位色 · 慢网/4K/5K 最低延迟)";
-        else if (draft.vnc_bpp == 32) qlabel = "原画真彩 (32位色 · 仅限局域网高速网络)";
+        std::string qlabel = (draft.vnc_bpp == 32)
+                                 ? "原画真彩 (32位色 · 仅限局域网高速网络)"
+                                 : "流畅高速 (16位色 · 推荐 4K/5K 高分屏共享)";
         rows.push_back({"f:res", "传输画质档位 (点击切换 · 不改变对面屏幕)", qlabel});
     } else {
         rows.push_back({"f:res", "桌面分辨率 (点击切换)", std::to_string(draft.req_width) + "x" + std::to_string(draft.req_height)});
