@@ -149,6 +149,10 @@ void ProfileManager::load(const std::string& path) {
             if (fields.size() >= 9) {
                 p.password = fields[8];
             }
+            if (fields.size() >= 10) {
+                int bpp = std::atoi(fields[9].c_str());
+                if (bpp == 8 || bpp == 16 || bpp == 32) p.vnc_bpp = static_cast<uint8_t>(bpp);
+            }
             p.from_mdns = false;
             saved_.push_back(p);
         }
@@ -158,13 +162,13 @@ void ProfileManager::load(const std::string& path) {
 void ProfileManager::save(const std::string& path) const {
     std::ofstream out(path, std::ios::trunc);
     if (!out.is_open()) return;
-    out << "# OunceDesk connections (proto|name|host|port|user|domain|w|h|password)\n";
+    out << "# OunceDesk connections (proto|name|host|port|user|domain|w|h|password|vnc_bpp)\n";
     for (const auto& p : saved_) {
         out << (p.protocol == ProtocolType::VNC_MACOS ? "VNC" : "RDP") << "|"
             << p.name << "|" << p.host << "|" << p.port << "|"
             << p.username << "|" << p.domain << "|"
             << p.req_width << "|" << p.req_height << "|"
-            << p.password << "\n";
+            << p.password << "|" << static_cast<int>(p.vnc_bpp) << "\n";
     }
 }
 

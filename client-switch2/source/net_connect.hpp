@@ -133,6 +133,14 @@ inline int tcp_connect(const std::string& host_in, uint16_t port_in, int timeout
         if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6) continue;
         int s = static_cast<int>(socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol));
         if (s < 0) continue;  // e.g. IPv6 unsupported on this network stack -> try next address
+        // Set SO_RCVBUF BEFORE connect() so the TCP SYN packet negotiates full RFC 7323 Window Scaling!
+        int rcv_buf = 2 * 1024 * 1024;
+        if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv_buf), sizeof(rcv_buf)) != 0) {
+            rcv_buf = 1024 * 1024;
+            setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv_buf), sizeof(rcv_buf));
+        }
+        int snd_buf = 512 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd_buf), sizeof(snd_buf));
         set_nb(s, true);
         int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         bool ok = (rc == 0);
@@ -162,10 +170,6 @@ inline int tcp_connect(const std::string& host_in, uint16_t port_in, int timeout
         set_nb(s, false);
         int one = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
-        int rcv_buf = 1024 * 1024;
-        int snd_buf = 256 * 1024;
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv_buf), sizeof(rcv_buf));
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd_buf), sizeof(snd_buf));
 #ifdef _WIN32
         DWORD tvv = 5000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tvv), sizeof(tvv));

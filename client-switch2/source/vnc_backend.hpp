@@ -56,9 +56,14 @@ private:
 
     int fb_w_ = 0;
     int fb_h_ = 0;
+    uint8_t vnc_bpp_ = 16;
+    uint32_t lut8_[256]{};
+    std::vector<uint32_t> lut16_;
     std::vector<uint32_t> fb_rgba_;
     std::vector<DirtyRect> dirty_rects_;
     bool full_dirty_ = false;
+    bool has_any_pixels_ = false;
+    bool initial_load_done_ = false;
 
     z_stream zstream_{};
     bool zstream_ok_ = false;
@@ -74,6 +79,7 @@ private:
     void set_status(const std::string& s);
     void set_error(const std::string& e);
     void send_fb_update_request(bool incremental);
+    void send_fb_region_request(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool incremental);
     void send_pointer(uint16_t x, uint16_t y, uint8_t mask);
     void send_keysym(uint32_t keysym, bool pressed);
 

@@ -37,9 +37,9 @@ inline void put_be32(uint8_t* p, uint32_t v) {
     p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v & 0xFF);
 }
 
-inline uint32_t cpixel_to_rgba(const uint8_t* p) {
-    // We request little-endian 32bpp R@0, G@8, B@16 -> CPIXEL (3 bytes) is R, G, B -> ABGR8888
-    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | 0xFF000000u;
+inline uint32_t bgra_cpixel_to_rgba(const uint8_t* p) {
+    // 32bpp native macOS BGRA (R@16, G@8, B@0) -> CPIXEL (3 bytes: B, G, R) -> ABGR8888 (R@0, G@8, B@16)
+    return uint32_t(p[2]) | (uint32_t(p[1]) << 8) | (uint32_t(p[0]) << 16) | 0xFF000000u;
 }
 
 }  // namespace
@@ -123,7 +123,7 @@ bool VncBackend::send_all(const uint8_t* data, size_t len) {
 }
 
 bool VncBackend::recv_all(uint8_t* data, size_t len) {
-    if (rx_cache_.empty()) rx_cache_.resize(65536);
+    if (rx_cache_.empty()) rx_cache_.resize(262144);
 
     size_t got = 0;
     while (got < len && !stop_.load()) {
@@ -176,17 +176,28 @@ bool VncBackend::recv_all(uint8_t* data, size_t len) {
 
 void VncBackend::mark_dirty(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
-    if (dirty_rects_.size() > 64) {
-        full_dirty_ = true;
-        dirty_rects_.clear();
-    } else if (!full_dirty_) {
-        dirty_rects_.push_back({x, y, w, h});
+    has_any_pixels_ = true;
+    if (!full_dirty_) {
+        if (dirty_rects_.size() >= 64) {
+            // Coalesce into bounding box instead of forcing full_dirty_ (avoids 45MB full upload on 4.5K/5K!)
+            int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+            for (const auto& r : dirty_rects_) {
+                x0 = std::min(x0, r.x);
+                y0 = std::min(y0, r.y);
+                x1 = std::max(x1, r.x + r.w);
+                y1 = std::max(y1, r.y + r.h);
+            }
+            dirty_rects_.clear();
+            dirty_rects_.push_back({x0, y0, x1 - x0, y1 - y0});
+        } else {
+            dirty_rects_.push_back({x, y, w, h});
+        }
     }
 }
 
 bool VncBackend::sync_texture(SDL_Renderer* renderer, SDL_Texture*& io_texture, int& out_w, int& out_h) {
     std::lock_guard<std::mutex> lk(fb_mu_);
-    if (fb_w_ <= 0 || fb_h_ <= 0 || fb_rgba_.empty()) return false;
+    if (fb_w_ <= 0 || fb_h_ <= 0 || fb_rgba_.empty() || !has_any_pixels_) return false;
 
     int tw = 0, th = 0;
     if (io_texture) {
@@ -201,15 +212,33 @@ bool VncBackend::sync_texture(SDL_Renderer* renderer, SDL_Texture*& io_texture, 
     out_w = fb_w_;
     out_h = fb_h_;
     if (!io_texture) return false;
-    if (in_fb_batch_ && !full_dirty_) return false;
+    // During initial high-res progressive load, never hold back bands — display them immediately!
+    if (initial_load_done_ && in_fb_batch_ && !full_dirty_) return false;
 
-    if (full_dirty_ || dirty_rects_.size() > 8) {
+    if (full_dirty_) {
         SDL_UpdateTexture(io_texture, nullptr, fb_rgba_.data(), fb_w_ * 4);
         full_dirty_ = false;
         dirty_rects_.clear();
         return true;
     }
     if (dirty_rects_.empty()) return false;
+    if (dirty_rects_.size() > 8) {
+        int x0 = fb_w_, y0 = fb_h_, x1 = 0, y1 = 0;
+        for (const auto& r : dirty_rects_) {
+            x0 = std::min(x0, std::max(0, r.x));
+            y0 = std::min(y0, std::max(0, r.y));
+            x1 = std::max(x1, std::min(fb_w_, r.x + r.w));
+            y1 = std::max(y1, std::min(fb_h_, r.y + r.h));
+        }
+        dirty_rects_.clear();
+        if (x1 > x0 && y1 > y0) {
+            SDL_Rect sr{x0, y0, x1 - x0, y1 - y0};
+            const uint32_t* ptr = fb_rgba_.data() + static_cast<size_t>(y0) * fb_w_ + x0;
+            SDL_UpdateTexture(io_texture, &sr, ptr, fb_w_ * 4);
+            return true;
+        }
+        return false;
+    }
     for (const auto& r : dirty_rects_) {
         int rx = std::max(0, std::min(r.x, fb_w_ - 1));
         int ry = std::max(0, std::min(r.y, fb_h_ - 1));
@@ -225,6 +254,17 @@ bool VncBackend::sync_texture(SDL_Renderer* renderer, SDL_Texture*& io_texture, 
     return true;
 }
 
+void VncBackend::send_fb_region_request(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool incremental) {
+    uint8_t msg[10]{};
+    msg[0] = 3;  // FramebufferUpdateRequest
+    msg[1] = incremental ? 1 : 0;
+    put_be16(msg + 2, x);
+    put_be16(msg + 4, y);
+    put_be16(msg + 6, w);
+    put_be16(msg + 8, h);
+    send_all(msg, sizeof(msg));
+}
+
 void VncBackend::send_fb_update_request(bool incremental) {
     int w = 0, h = 0;
     {
@@ -232,14 +272,7 @@ void VncBackend::send_fb_update_request(bool incremental) {
         w = fb_w_;
         h = fb_h_;
     }
-    uint8_t msg[10]{};
-    msg[0] = 3;  // FramebufferUpdateRequest
-    msg[1] = incremental ? 1 : 0;
-    put_be16(msg + 2, 0);
-    put_be16(msg + 4, 0);
-    put_be16(msg + 6, static_cast<uint16_t>(w));
-    put_be16(msg + 8, static_cast<uint16_t>(h));
-    send_all(msg, sizeof(msg));
+    send_fb_region_request(0, 0, static_cast<uint16_t>(w), static_cast<uint16_t>(h), incremental);
 }
 
 void VncBackend::send_pointer(uint16_t x, uint16_t y, uint8_t mask) {
@@ -326,9 +359,10 @@ bool VncBackend::detect_text_focus_near(float norm_x, float norm_y) const {
 }
 
 bool VncBackend::decode_raw_rect(int rx, int ry, int rw, int rh) {
-    std::vector<uint32_t> row_buf(static_cast<size_t>(rw));
+    const size_t pix_sz = std::max<size_t>(1, vnc_bpp_ / 8);
+    std::vector<uint8_t> row_buf(static_cast<size_t>(rw) * pix_sz);
     for (int y = 0; y < rh; ++y) {
-        if (!recv_all(reinterpret_cast<uint8_t*>(row_buf.data()), static_cast<size_t>(rw) * 4)) {
+        if (!recv_all(row_buf.data(), row_buf.size())) {
             return false;
         }
         std::lock_guard<std::mutex> lk(fb_mu_);
@@ -337,7 +371,19 @@ bool VncBackend::decode_raw_rect(int rx, int ry, int rw, int rh) {
             int copy_w = std::min(rw, fb_w_ - rx);
             if (copy_w > 0 && rx >= 0) {
                 uint32_t* dst = fb_rgba_.data() + static_cast<size_t>(dy) * fb_w_ + rx;
-                for (int x = 0; x < copy_w; ++x) dst[x] = row_buf[x] | 0xFF000000u;
+                if (vnc_bpp_ == 8) {
+                    for (int x = 0; x < copy_w; ++x) dst[x] = lut8_[row_buf[x]];
+                } else if (vnc_bpp_ == 16) {
+                    for (int x = 0; x < copy_w; ++x) {
+                        uint16_t v = uint16_t(row_buf[x * 2]) | (uint16_t(row_buf[x * 2 + 1]) << 8);
+                        dst[x] = lut16_[v];
+                    }
+                } else {
+                    for (int x = 0; x < copy_w; ++x) {
+                        const uint8_t* p = row_buf.data() + x * 4;
+                        dst[x] = uint32_t(p[2]) | (uint32_t(p[1]) << 8) | (uint32_t(p[0]) << 16) | 0xFF000000u;
+                    }
+                }
             }
         }
     }
@@ -394,10 +440,17 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
         zstream_ok_ = true;
     }
 
+    const size_t cpix_sz = (vnc_bpp_ == 8) ? 1 : (vnc_bpp_ == 16 ? 2 : 3);
+    auto read_cpixel = [&](const uint8_t* p) -> uint32_t {
+        if (vnc_bpp_ == 8) return lut8_[p[0]];
+        if (vnc_bpp_ == 16) return lut16_[uint16_t(p[0]) | (uint16_t(p[1]) << 8)];
+        return bgra_cpixel_to_rgba(p);
+    };
+
     // Decompress persistent zlib stream
     std::vector<uint8_t> raw;
-    raw.reserve(static_cast<size_t>(rw) * rh * 3 + 256);
-    uint8_t chunk[32768];
+    raw.reserve(static_cast<size_t>(rw) * rh * cpix_sz + 256);
+    uint8_t chunk[65536];
     zstream_.next_in = comp.data();
     zstream_.avail_in = static_cast<uInt>(comp.size());
     while (zstream_.avail_in > 0) {
@@ -418,16 +471,16 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
         int th = std::min(64, ry + rh - ty);
         for (int tx = rx; tx < rx + rw; tx += 64) {
             int tw = std::min(64, rx + rw - tx);
-            if (!avail(1)) return true;
+            if (!avail(1)) { mark_dirty(rx, ry, rw, rh); return true; }
             uint8_t sub = raw[pos++];
 
             if (sub == 0) {
-                // Raw CPIXELs (3 bytes each)
+                // Raw CPIXELs (1, 2, or 3 bytes each)
                 for (int y = 0; y < th; ++y) {
                     for (int x = 0; x < tw; ++x) {
-                        if (!avail(3)) return true;
-                        uint32_t c = cpixel_to_rgba(raw.data() + pos);
-                        pos += 3;
+                        if (!avail(cpix_sz)) { mark_dirty(rx, ry, rw, rh); return true; }
+                        uint32_t c = read_cpixel(raw.data() + pos);
+                        pos += cpix_sz;
                         if (ty + y < fb_h_ && tx + x < fb_w_) {
                             fb_rgba_[static_cast<size_t>(ty + y) * fb_w_ + (tx + x)] = c;
                         }
@@ -435,9 +488,9 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
                 }
             } else if (sub == 1) {
                 // Solid tile
-                if (!avail(3)) return true;
-                uint32_t c = cpixel_to_rgba(raw.data() + pos);
-                pos += 3;
+                if (!avail(cpix_sz)) { mark_dirty(rx, ry, rw, rh); return true; }
+                uint32_t c = read_cpixel(raw.data() + pos);
+                pos += cpix_sz;
                 for (int y = 0; y < th; ++y) {
                     if (ty + y >= fb_h_) break;
                     uint32_t* dst = fb_rgba_.data() + static_cast<size_t>(ty + y) * fb_w_ + tx;
@@ -448,9 +501,9 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
                 // Packed palette
                 uint32_t pal[16]{};
                 for (int i = 0; i < sub; ++i) {
-                    if (!avail(3)) return true;
-                    pal[i] = cpixel_to_rgba(raw.data() + pos);
-                    pos += 3;
+                    if (!avail(cpix_sz)) { mark_dirty(rx, ry, rw, rh); return true; }
+                    pal[i] = read_cpixel(raw.data() + pos);
+                    pos += cpix_sz;
                 }
                 int bpp = (sub == 2) ? 1 : (sub <= 4 ? 2 : 4);
                 int mask = (1 << bpp) - 1;
@@ -459,7 +512,7 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
                     int bits_left = 0;
                     for (int x = 0; x < tw; ++x) {
                         if (bits_left == 0) {
-                            if (!avail(1)) return true;
+                            if (!avail(1)) { mark_dirty(rx, ry, rw, rh); return true; }
                             cur_byte = raw[pos++];
                             bits_left = 8;
                         }
@@ -474,9 +527,9 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
                 // Plain RLE
                 int pixels = tw * th;
                 int p_idx = 0;
-                while (p_idx < pixels && avail(4)) {
-                    uint32_t c = cpixel_to_rgba(raw.data() + pos);
-                    pos += 3;
+                while (p_idx < pixels && avail(cpix_sz + 1)) {
+                    uint32_t c = read_cpixel(raw.data() + pos);
+                    pos += cpix_sz;
                     int rlen = 1;
                     while (avail(1)) {
                         uint8_t b = raw[pos++];
@@ -496,9 +549,9 @@ bool VncBackend::decode_zrle_rect(int rx, int ry, int rw, int rh) {
                 int psize = sub - 128;
                 uint32_t pal[128]{};
                 for (int i = 0; i < psize; ++i) {
-                    if (!avail(3)) return true;
-                    pal[i] = cpixel_to_rgba(raw.data() + pos);
-                    pos += 3;
+                    if (!avail(cpix_sz)) { mark_dirty(rx, ry, rw, rh); return true; }
+                    pal[i] = read_cpixel(raw.data() + pos);
+                    pos += cpix_sz;
                 }
                 int pixels = tw * th;
                 int p_idx = 0;
@@ -687,28 +740,59 @@ void VncBackend::run_session() {
         fb_w_ = std::max(1, sw);
         fb_h_ = std::max(1, sh);
         fb_rgba_.assign(static_cast<size_t>(fb_w_) * fb_h_, 0xFF0A0E18u);
+        dirty_rects_.clear();
         full_dirty_ = true;
+        has_any_pixels_ = false;
+        initial_load_done_ = false;
+        in_fb_batch_ = false;
     }
+
+    vnc_bpp_ = (profile_.vnc_bpp == 8 || profile_.vnc_bpp == 16 || profile_.vnc_bpp == 32) ? profile_.vnc_bpp : 16;
+    if (vnc_bpp_ == 8) {
+        for (int v = 0; v < 256; ++v) {
+            uint32_t r8 = static_cast<uint32_t>(((v & 7) * 255 + 3) / 7);
+            uint32_t g8 = static_cast<uint32_t>((((v >> 3) & 7) * 255 + 3) / 7);
+            uint32_t b8 = static_cast<uint32_t>((((v >> 6) & 3) * 255 + 1) / 3);
+            lut8_[v] = r8 | (g8 << 8) | (b8 << 16) | 0xFF000000u;
+        }
+    } else if (vnc_bpp_ == 16) {
+        lut16_.resize(65536);
+        for (uint32_t v = 0; v < 65536; ++v) {
+            uint32_t r5 = (v >> 11) & 31u;
+            uint32_t g6 = (v >> 5) & 63u;
+            uint32_t b5 = v & 31u;
+            uint32_t r8 = (r5 << 3) | (r5 >> 2);
+            uint32_t g8 = (g6 << 2) | (g6 >> 4);
+            uint32_t b8 = (b5 << 3) | (b5 >> 2);
+            lut16_[v] = r8 | (g8 << 8) | (b8 << 16) | 0xFF000000u;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lk(info_mu_);
-        stats_.protocol_label = auth_label;
+        stats_.protocol_label = auth_label + " " + std::to_string(vnc_bpp_) + "位";
         stats_.fb_width = sw;
         stats_.fb_height = sh;
     }
 
-    // 5. SetPixelFormat (32bpp little-endian R@0, G@8, B@16 -> native SDL_PIXELFORMAT_ABGR8888)
+    // 5. SetPixelFormat: 16bpp RGB565 (default 5x faster ZRLE on 4K/5K!), 8bpp BGR233 (15x faster WAN), or 32bpp BGRA
     uint8_t spf[20]{};
     spf[0] = 0;  // SetPixelFormat
-    spf[4] = 32; // bits-per-pixel
-    spf[5] = 24; // depth (enables 3-byte CPIXEL in ZRLE!)
     spf[6] = 0;  // big-endian-flag = 0 (little endian)
     spf[7] = 1;  // true-color-flag = 1
-    put_be16(spf + 8, 255);   // red-max
-    put_be16(spf + 10, 255);  // green-max
-    put_be16(spf + 12, 255);  // blue-max
-    spf[14] = 0;  // red-shift
-    spf[15] = 8;  // green-shift
-    spf[16] = 16; // blue-shift
+    if (vnc_bpp_ == 8) {
+        spf[4] = 8;  spf[5] = 8;
+        put_be16(spf + 8, 7);   put_be16(spf + 10, 7);  put_be16(spf + 12, 3);
+        spf[14] = 0; spf[15] = 3; spf[16] = 6;  // standard BGR233
+    } else if (vnc_bpp_ == 16) {
+        spf[4] = 16; spf[5] = 16;
+        put_be16(spf + 8, 31);  put_be16(spf + 10, 63); put_be16(spf + 12, 31);
+        spf[14] = 11; spf[15] = 5; spf[16] = 0; // RGB565
+    } else {
+        spf[4] = 32; spf[5] = 24;
+        put_be16(spf + 8, 255); put_be16(spf + 10, 255); put_be16(spf + 12, 255);
+        spf[14] = 16; spf[15] = 8; spf[16] = 0; // native macOS BGRA (zero server swizzle!)
+    }
     if (!send_all(spf, sizeof(spf))) { set_error("SetPixelFormat failed"); return; }
 
     // 6. SetEncodings: ZRLE (16), CopyRect (1), Raw (0), DesktopSize (-223), CursorWithAlpha (-314), Cursor (-239)
@@ -724,8 +808,22 @@ void VncBackend::run_session() {
     if (!send_all(encs, sizeof(encs))) { set_error("SetEncodings failed"); return; }
 
     state_.store(BackendState::STREAMING);
-    set_status("Connected to " + desk_name);
-    send_fb_update_request(false);
+    set_status("正在加载 " + std::to_string(sw) + "x" + std::to_string(sh) + " 远程桌面首帧...");
+
+    // Progressive horizontal strip loading for high-res 4K/5K Macs (e.g. 4480x2520):
+    // fetches 6 strips so top of screen appears within <1 second instead of waiting for the entire 4.5K screen!
+    const int init_bands = (static_cast<int64_t>(sw) * sh > 2073600LL) ? 6 : 1;
+    auto send_init_band = [&](int idx) {
+        int y0 = (sh * idx) / init_bands;
+        int y1 = (sh * (idx + 1)) / init_bands;
+        if (y1 > y0) {
+            send_fb_region_request(0, static_cast<uint16_t>(y0),
+                                   static_cast<uint16_t>(sw), static_cast<uint16_t>(y1 - y0), false);
+        }
+    };
+    int next_init_band = 1;
+    int init_bands_done = 0;
+    send_init_band(0);
 
     uint64_t stat_t0 = platform::now_us();
     int frames_win = 0;
@@ -742,13 +840,16 @@ void VncBackend::run_session() {
             uint8_t hdr[3];
             if (!recv_all(hdr, 3)) break;
             uint16_t nrects = be16(hdr + 1);
-            // Send next incremental FramebufferUpdateRequest IMMEDIATELY so server overlaps encoding
-            // the next frame while we decode the current frame's rectangles (eliminates 1x RTT stall per frame!)
-            bool full = want_full_refresh_.exchange(false);
-            send_fb_update_request(!full);
+            // Pipeline the next strip (during initial load) or next incremental full-screen update!
+            if (next_init_band < init_bands) {
+                send_init_band(next_init_band++);
+            } else {
+                bool full = want_full_refresh_.exchange(false);
+                send_fb_update_request(!full);
+            }
             {
                 std::lock_guard<std::mutex> lk(fb_mu_);
-                in_fb_batch_ = true;
+                in_fb_batch_ = initial_load_done_;
             }
             for (uint16_t i = 0; i < nrects && !stop_.load(); ++i) {
                 uint8_t rhdr[12];
@@ -802,8 +903,8 @@ void VncBackend::run_session() {
                         cursor_text_.store(cursor_detect::is_ibeam(vis, rw, rh, rx, ry));
                     }
                 } else if (enc == -239) {
-                    // Cursor pseudo-encoding: rx/ry = hotspot, w*h pixels (4 bytes each) + 1bpp mask
-                    size_t pix_len = static_cast<size_t>(rw) * rh * 4;
+                    // Cursor pseudo-encoding: rx/ry = hotspot, w*h pixels (bpp/8 bytes each) + 1bpp mask
+                    size_t pix_len = static_cast<size_t>(rw) * rh * std::max<size_t>(1, vnc_bpp_ / 8);
                     size_t mask_stride = static_cast<size_t>((rw + 7) / 8);
                     size_t mask_len = mask_stride * rh;
                     std::vector<uint8_t> cbuf(pix_len + mask_len);
@@ -830,6 +931,9 @@ void VncBackend::run_session() {
             {
                 std::lock_guard<std::mutex> lk(fb_mu_);
                 in_fb_batch_ = false;
+                if (!initial_load_done_ && has_any_pixels_ && ++init_bands_done >= init_bands) {
+                    initial_load_done_ = true;
+                }
             }
             ++frames_win;
         } else if (msg_type == 1) {

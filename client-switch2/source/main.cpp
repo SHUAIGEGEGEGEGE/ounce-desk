@@ -221,7 +221,7 @@ int main(int argc, char* argv[]) {
     bool running = true;
 
     auto form_field_count = [&]() -> int {
-        return (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+        return 7;
     };
     auto form_total_items = [&]() -> int {
         return form_field_count() + 3;
@@ -234,6 +234,7 @@ int main(int argc, char* argv[]) {
         draft.host = "";
         draft.req_width = 1920;
         draft.req_height = 1080;
+        draft.vnc_bpp = 16;
         form_focus = 2;  // Focus Server Address by default (Name at index 1 is optional)
         form_error.clear();
         show_home_menu = false;
@@ -316,9 +317,15 @@ int main(int argc, char* argv[]) {
             if (platform::show_system_keyboard("请输入登录密码", draft.password, v, false, true)) {
                 draft.password = v;
             }
-        } else if (field_idx == 6 && draft.protocol == ProtocolType::RDP_WINDOWS) {
-            if (draft.req_width == 1920) { draft.req_width = 1280; draft.req_height = 720; }
-            else { draft.req_width = 1920; draft.req_height = 1080; }
+        } else if (field_idx == 6) {
+            if (draft.protocol == ProtocolType::VNC_MACOS) {
+                if (draft.vnc_bpp == 16) draft.vnc_bpp = 8;
+                else if (draft.vnc_bpp == 8) draft.vnc_bpp = 32;
+                else draft.vnc_bpp = 16;
+            } else {
+                if (draft.req_width == 1920) { draft.req_width = 1280; draft.req_height = 720; }
+                else { draft.req_width = 1920; draft.req_height = 1080; }
+            }
         }
     };
 
@@ -572,7 +579,7 @@ int main(int argc, char* argv[]) {
                         size_t idx = static_cast<size_t>(std::atoi(btn.id.c_str() + 4));
                         if (idx < win_profs.size()) {
                             draft = win_profs[idx];
-                            int nf = (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+                            int nf = form_field_count();
                             form_focus = draft.username.empty() ? 4 : (draft.password.empty() ? 5 : (nf + 2));
                             form_error.clear();
                             mode = AppMode::FORM;
@@ -581,7 +588,7 @@ int main(int argc, char* argv[]) {
                         size_t idx = static_cast<size_t>(std::atoi(btn.id.c_str() + 4));
                         if (idx < mac_profs.size()) {
                             draft = mac_profs[idx];
-                            int nf = (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+                            int nf = form_field_count();
                             form_focus = draft.username.empty() ? 4 : (draft.password.empty() ? 5 : (nf + 2));
                             form_error.clear();
                             mode = AppMode::FORM;
@@ -793,7 +800,7 @@ int main(int argc, char* argv[]) {
                         profiles.remove_saved(cur_list[selected_row], profiles_path);
                     } else if (b == SDL_CONTROLLER_BUTTON_A && !cur_list.empty()) {
                         draft = cur_list[selected_row];
-                        int nf = (draft.protocol == ProtocolType::VNC_MACOS) ? 6 : 7;
+                        int nf = form_field_count();
                         form_focus = draft.username.empty() ? 4 : (draft.password.empty() ? 5 : (nf + 2));
                         form_error.clear();
                         mode = AppMode::FORM;
@@ -833,7 +840,7 @@ int main(int argc, char* argv[]) {
                     if (sym == SDLK_ESCAPE) mode = AppMode::BROWSER;
                     else if (sym == SDLK_TAB) form_focus = (form_focus + 1) % total_items;
                     else if (sym == SDLK_RETURN) {
-                        if (form_focus == 0 || (form_focus == 6 && draft.protocol == ProtocolType::RDP_WINDOWS)) edit_form_field(form_focus);
+                        if (form_focus == 0 || form_focus == 6) edit_form_field(form_focus);
                         else start_connection(draft, false);
                     } else if (sym == SDLK_BACKSPACE) {
                         if (form_focus == 1 && !draft.name.empty()) draft.name.pop_back();
@@ -996,7 +1003,9 @@ int main(int argc, char* argv[]) {
                 input.update_viewport_rect(LOGICAL_W, LOGICAL_H, fb_w, fb_h);
                 SDL_RenderCopy(renderer, fb_texture, nullptr, &input.viewport().dst_rect);
             } else {
-                ui.draw_text(LOGICAL_W / 2 - 200, LOGICAL_H / 2 - 12, "正在等待远程桌面画面...", {200, 215, 235, 255}, 2);
+                std::string wait_msg = backend->status_text();
+                if (wait_msg.empty()) wait_msg = "正在等待远程桌面画面...";
+                ui.draw_text(LOGICAL_W / 2 - 260, LOGICAL_H / 2 - 12, wait_msg, {200, 215, 235, 255}, 2);
             }
 
             if (input.touch_mode() == TouchMode::MOUSE) {

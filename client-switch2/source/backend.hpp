@@ -47,6 +47,7 @@ struct ConnectionProfile {
     std::string domain;       // Optional Windows domain / workgroup
     uint16_t req_width = 1920;
     uint16_t req_height = 1080;
+    uint8_t vnc_bpp = 16;     // Mac VNC color depth: 16 (fast default), 8 (ultra-fast 4K/5K WAN), 32 (lossless LAN)
     bool from_mdns = false;   // Auto-discovered via Bonjour (_rfb._tcp.local)
 };
 

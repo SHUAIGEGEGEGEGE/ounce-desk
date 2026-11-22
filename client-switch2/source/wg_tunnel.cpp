@@ -47,7 +47,9 @@ constexpr uint64_t REKEY_AFTER_US = 120ULL * 1000000ULL;
 constexpr uint64_t REJECT_AFTER_US = 180ULL * 1000000ULL;
 constexpr uint64_t REKEY_TIMEOUT_US = 5ULL * 1000000ULL;
 constexpr size_t SNDBUF_MAX = 512 * 1024;
-constexpr size_t RCV_WINDOW = 65535;
+constexpr size_t RCV_WINDOW_UNSCALED = 65535;
+constexpr uint8_t RCV_WSCALE_OFFER = 4;                  // 16x scale -> 512 KB receive window
+constexpr size_t RCV_WINDOW_SCALED = 512 * 1024;
 
 const char* CONSTRUCTION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const char* IDENTIFIER = "WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -247,7 +249,11 @@ struct Tcb {
     bool peer_fin = false, local_shut = false;
     int lsock = -1;
     uint64_t created_us = 0;
-    uint16_t last_wnd_adv = 0;
+    uint32_t last_wnd_bytes = 0;
+    uint8_t rcv_wscale = 0;
+    uint8_t snd_wscale = 0;
+    uint8_t unacked_segs = 0;
+    bool ack_pending = false;
 };
 
 struct Forward {
@@ -431,6 +437,14 @@ void Tunnel::run() {
         if (S.usock >= 0) WG_CLOSE(S.usock);
         S.usock = static_cast<int>(socket(fam, SOCK_DGRAM, IPPROTO_UDP));
         if (S.usock < 0) return false;
+        // Large UDP socket buffers prevent Horizon OS bsd tail-drops on 4K/5K screen bursts!
+        int rcvbuf = 2 * 1024 * 1024;
+        if (setsockopt(S.usock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf)) != 0) {
+            rcvbuf = 512 * 1024;
+            setsockopt(S.usock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+        }
+        int sndbuf = 512 * 1024;
+        setsockopt(S.usock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
         set_nb(S.usock);
         S.ep_resolved_us = platform::now_us();
         return true;
@@ -507,8 +521,12 @@ void Tunnel::run() {
     auto send_keepalive = [&]() { send_transport(nullptr, 0); };
 
     // ---- TCP/IP output
+    auto tcp_rcv_cap = [](const Tcb& t) -> size_t {
+        return t.rcv_wscale ? RCV_WINDOW_SCALED : RCV_WINDOW_UNSCALED;
+    };
+
     auto tcp_emit = [&](Tcb& t, uint32_t seq, const uint8_t* data, size_t len, uint8_t flags) {
-        size_t opt = (flags & 0x02) ? 4 : 0;
+        size_t opt = (flags & 0x02) ? 8 : 0;  // MSS (4B) + NOP (1B) + WSOPT (3B)
         size_t tcp_len = 20 + opt + len;
         std::vector<uint8_t> pkt(20 + tcp_len, 0);
         uint8_t* ip = pkt.data();
@@ -528,13 +546,27 @@ void Tunnel::run() {
         be32w(tcp + 8, (flags & 0x10) ? t.rcv_nxt : 0);
         tcp[12] = static_cast<uint8_t>(((20 + opt) / 4) << 4);
         tcp[13] = flags;
-        size_t pending = t.to_local.size();
-        uint16_t wnd = static_cast<uint16_t>(pending >= RCV_WINDOW ? 0 : RCV_WINDOW - pending);
-        t.last_wnd_adv = wnd;
+        uint16_t wnd = 65535;
+        if (!(flags & 0x02)) {
+            size_t cap = tcp_rcv_cap(t);
+            size_t pending = t.to_local.size();
+            size_t avail = (pending >= cap) ? 0 : (cap - pending);
+            t.last_wnd_bytes = static_cast<uint32_t>(avail);
+            uint32_t scaled = static_cast<uint32_t>(avail >> t.rcv_wscale);
+            wnd = static_cast<uint16_t>(std::min<uint32_t>(scaled, 65535u));
+        } else {
+            t.last_wnd_bytes = 65535;
+        }
         be16w(tcp + 14, wnd);
         if (opt) {
             tcp[20] = 2; tcp[21] = 4;
             be16w(tcp + 22, static_cast<uint16_t>(S.cfg.mtu - 40 - 20));  // MSS
+            tcp[24] = 1;                                                   // NOP
+            tcp[25] = 3; tcp[26] = 3; tcp[27] = RCV_WSCALE_OFFER;          // RFC 7323 Window Scale
+        }
+        if (flags & 0x10) {
+            t.ack_pending = false;
+            t.unacked_segs = 0;
         }
         if (len) std::memcpy(tcp + 20 + opt, data, len);
         uint8_t pseudo[12];
@@ -583,12 +615,13 @@ void Tunnel::run() {
     auto flush_to_local = [&](Tcb& t) {
         while (!t.to_local.empty() && t.lsock >= 0) {
             int n = static_cast<int>(send(t.lsock, reinterpret_cast<const char*>(t.to_local.data()),
-                                          static_cast<int>(std::min<size_t>(t.to_local.size(), 65536)), 0));
+                                          static_cast<int>(std::min<size_t>(t.to_local.size(), 131072)), 0));
             if (n > 0) {
-                uint16_t before = t.last_wnd_adv;
+                uint32_t before = t.last_wnd_bytes;
                 t.to_local.erase(t.to_local.begin(), t.to_local.begin() + n);
+                size_t cap = tcp_rcv_cap(t);
                 // Window re-opened substantially -> send window update
-                if (before < 16384 && t.to_local.size() + 16384 < RCV_WINDOW && t.st == Tcb::ESTABLISHED) {
+                if (before < cap / 4 && t.to_local.size() + cap / 4 < cap && t.st == Tcb::ESTABLISHED) {
                     tcp_emit(t, t.snd_nxt, nullptr, 0, 0x10);
                 }
             } else {
@@ -634,27 +667,33 @@ void Tunnel::run() {
         }
         if (t.st == Tcb::SYN_SENT) {
             if ((flags & 0x12) == 0x12 && ack == t.iss + 1) {
-                // parse MSS option
+                // parse MSS + RFC 7323 Window Scale options
                 for (size_t o = 20; o + 1 < doff;) {
                     uint8_t kind = tcp[o];
                     if (kind == 0) break;
                     if (kind == 1) { ++o; continue; }
                     uint8_t l = tcp[o + 1];
                     if (l < 2 || o + l > doff) break;
-                    if (kind == 2 && l == 4) t.mss = std::min<uint16_t>(be16r(tcp + o + 2), static_cast<uint16_t>(S.cfg.mtu - 60));
+                    if (kind == 2 && l == 4) {
+                        t.mss = std::min<uint16_t>(be16r(tcp + o + 2), static_cast<uint16_t>(S.cfg.mtu - 60));
+                    } else if (kind == 3 && l == 3) {
+                        t.snd_wscale = std::min<uint8_t>(tcp[o + 2], 14);
+                        t.rcv_wscale = RCV_WSCALE_OFFER;
+                    }
                     o += l;
                 }
                 t.rcv_nxt = seq + 1;
                 t.snd_una = ack;
                 t.snd_nxt = ack;
                 t.snd_max = ack;
-                t.snd_wnd = win;
+                t.snd_wnd = win;  // SYN+ACK window itself is unscaled per RFC 7323
                 t.st = Tcb::ESTABLISHED;
                 t.retries = 0;
                 t.rto_deadline = 0;
                 t.rto_ms = 1000;
                 tcp_emit(t, t.snd_nxt, nullptr, 0, 0x10);
-                platform::log_line("[WG] TCP connected " + ip_str(t.dst) + ":" + std::to_string(t.dport));
+                platform::log_line("[WG] TCP connected " + ip_str(t.dst) + ":" + std::to_string(t.dport) +
+                                   " wscale=" + std::to_string(t.rcv_wscale));
                 tcp_output(t, now);
             }
             return;
@@ -663,6 +702,7 @@ void Tunnel::run() {
 
         // ---- ACK processing
         if (flags & 0x10) {
+            uint32_t scaled_win = static_cast<uint32_t>(win) << t.snd_wscale;
             if (seq_gt(ack, t.snd_una) && seq_le(ack, t.snd_max)) {
                 uint32_t acked = ack - t.snd_una;
                 size_t data_acked = std::min<size_t>(acked, t.sbuf.size());
@@ -679,23 +719,24 @@ void Tunnel::run() {
                     t.rtt_timing = false;
                 }
                 t.rto_deadline = (t.snd_una == t.snd_nxt) ? 0 : now + static_cast<uint64_t>(t.rto_ms) * 1000ULL;
-            } else if (ack == t.snd_una && dlen == 0 && t.snd_nxt != t.snd_una && win == t.snd_wnd) {
+            } else if (ack == t.snd_una && dlen == 0 && t.snd_nxt != t.snd_una && scaled_win == t.snd_wnd) {
                 if (++t.dupacks == 3 && !t.sbuf.empty()) {
                     size_t len = std::min<size_t>(t.mss, t.sbuf.size());
                     tcp_emit(t, t.snd_una, t.sbuf.data(), len, 0x18);
                     t.rtt_timing = false;
                 }
             }
-            t.snd_wnd = win;
+            t.snd_wnd = scaled_win;
         }
 
         // ---- data
-        bool need_ack = false;
+        bool immediate_ack = false;
         if (dlen > 0) {
-            need_ack = true;
+            t.ack_pending = true;
             if (seq == t.rcv_nxt) {
                 t.to_local.insert(t.to_local.end(), data, data + dlen);
                 t.rcv_nxt += static_cast<uint32_t>(dlen);
+                if (++t.unacked_segs >= 2) immediate_ack = true;
                 // pull contiguous out-of-order segments
                 while (!t.ooo.empty()) {
                     auto it = t.ooo.begin();
@@ -708,24 +749,28 @@ void Tunnel::run() {
                         t.rcv_nxt += static_cast<uint32_t>(v.size() - skip);
                     }
                     t.ooo.erase(it);
+                    immediate_ack = true;
                 }
             } else if (seq_gt(seq, t.rcv_nxt)) {
-                if (t.ooo.size() < 256 && seq_lt(seq, t.rcv_nxt + static_cast<uint32_t>(RCV_WINDOW * 4))) {
+                immediate_ack = true;  // duplicate ACK triggers peer Fast Retransmit immediately!
+                if (t.ooo.size() < 512 && seq_lt(seq, t.rcv_nxt + static_cast<uint32_t>(tcp_rcv_cap(t) * 2))) {
                     t.ooo[seq] = std::vector<uint8_t>(data, data + dlen);
                 }
             } else if (seq_gt(seq + static_cast<uint32_t>(dlen), t.rcv_nxt)) {
                 uint32_t skip = t.rcv_nxt - seq;
                 t.to_local.insert(t.to_local.end(), data + skip, data + dlen);
                 t.rcv_nxt += static_cast<uint32_t>(dlen - skip);
+                immediate_ack = true;
             }
         }
         if ((flags & 0x01) && !t.peer_fin && seq + static_cast<uint32_t>(dlen) == t.rcv_nxt) {
             t.rcv_nxt++;
             t.peer_fin = true;
-            need_ack = true;
+            immediate_ack = true;
         }
-        if (need_ack) tcp_emit(t, t.snd_nxt, nullptr, 0, 0x10);
+        // Drain to local loopback FIRST so ACK advertises the freshly freed receive window!
         flush_to_local(t);
+        if (immediate_ack && t.ack_pending) tcp_emit(t, t.snd_nxt, nullptr, 0, 0x10);
         tcp_output(t, now);
     };
 
@@ -896,7 +941,7 @@ void Tunnel::run() {
         if (sel > 0) {
             // UDP
             if (S.usock >= 0 && FD_ISSET(S.usock, &rfds)) {
-                for (int i = 0; i < 64; ++i) {
+                for (int i = 0; i < 256; ++i) {
                     sockaddr_storage from{};
                     wg_socklen_t fl = sizeof(from);
                     int n = static_cast<int>(recvfrom(S.usock, reinterpret_cast<char*>(rbuf.data()), static_cast<int>(rbuf.size()), 0,
@@ -904,12 +949,19 @@ void Tunnel::run() {
                     if (n <= 0) break;
                     handle_udp(rbuf.data(), static_cast<size_t>(n));
                 }
+                for (auto& up : S.tcbs) {
+                    if (up->st == Tcb::ESTABLISHED && up->ack_pending) {
+                        tcp_emit(*up, up->snd_nxt, nullptr, 0, 0x10);
+                    }
+                }
             }
             // accept forwards
             for (auto it = S.forwards.begin(); it != S.forwards.end();) {
                 if (FD_ISSET(it->listen_sock, &rfds)) {
                     int cs = static_cast<int>(accept(it->listen_sock, nullptr, nullptr));
                     if (cs >= 0) {
+                        int lsnd = 1024 * 1024;
+                        setsockopt(cs, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&lsnd), sizeof(lsnd));
                         set_nb(cs);
                         auto t = std::make_unique<Tcb>();
                         t->lsock = cs;
