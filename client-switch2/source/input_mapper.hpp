@@ -33,8 +33,10 @@ public:
         two_finger_gesture_ = false;
     }
     TouchMode touch_mode() const { return touch_mode_; }
+    bool show_local_cursor() const { return touch_mode_ == TouchMode::MOUSE || hw_mouse_visible_; }
     void toggle_touch_mode() {
         set_touch_mode((touch_mode_ == TouchMode::TOUCH) ? TouchMode::MOUSE : TouchMode::TOUCH);
+        hw_mouse_visible_ = (touch_mode_ == TouchMode::MOUSE);
     }
 
     // Mouse sensitivity multiplier (0.2x .. 3.0x), applied to trackpad, stick and USB mouse movement
@@ -63,12 +65,14 @@ public:
     // Handle SDL events while in active STREAMING state
     bool handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, int win_w, int win_h, bool& out_open_swkbd);
 
-    void update_frame(float dt_sec, SDL_GameController* pad, RemoteBackend& backend);
+    // Returns true if physical/Joy-Con mouse clicked the top-left Menu pill.
+    bool update_frame(float dt_sec, SDL_GameController* pad, RemoteBackend& backend, const SDL_Rect& menu_pill);
     void sync_pad_buttons(SDL_GameController* pad);
     void send_shortcut(RemoteBackend& backend, ProtocolType proto, const std::string& action);
 
 private:
     TouchMode touch_mode_ = TouchMode::TOUCH;
+    bool hw_mouse_visible_ = false;
     float sensitivity_ = 1.0f;
     ViewportState vp_;
 

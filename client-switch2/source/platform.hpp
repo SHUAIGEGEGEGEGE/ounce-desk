@@ -11,8 +11,9 @@ struct PhysicalMouseDelta {
     int32_t dy = 0;
     int32_t wheel_x = 0;
     int32_t wheel_y = 0;
-    uint32_t buttons = 0;  // bit0=L, bit1=R, bit2=M, bit3=Back, bit4=Forward
+    uint32_t buttons = 0;      // bit0=L, bit1=R, bit2=M, bit3=Back, bit4=Forward
     bool active = false;
+    bool joycon_mouse = false; // true when Switch 2 Joy-Con 2 optical mouse (Nmouse) is engaged
 };
 
 struct PhysicalKeyTransition {

@@ -80,6 +80,7 @@ bool InputMapper::on_touch_down(uint64_t finger_id, float sx, float sy, RemoteBa
         prev_two_mid_x_ = 0.5f * (f0.x + f1.x);
         prev_two_mid_y_ = 0.5f * (f0.y + f1.y);
     } else if (fingers_.size() == 1 && touch_mode_ == TouchMode::TOUCH) {
+        hw_mouse_visible_ = false;
         float nx, ny;
         if (screen_to_norm(sx, sy, nx, ny)) {
             vp_.cursor_x = nx;
@@ -279,11 +280,15 @@ bool InputMapper::handle_sdl_event(const SDL_Event& ev, RemoteBackend& backend, 
     return false;
 }
 
-void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBackend& backend) {
+bool InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBackend& backend, const SDL_Rect& menu_pill) {
+    bool open_menu = false;
     platform::PhysicalMouseDelta pm{};
     std::vector<platform::PhysicalKeyTransition> pkeys;
     platform::poll_physical_hid(pm, pkeys);
     if (pm.active) {
+        if (pm.dx != 0 || pm.dy != 0 || pm.buttons != 0 || pm.joycon_mouse) {
+            hw_mouse_visible_ = true;
+        }
         if (pm.dx != 0 || pm.dy != 0) {
             vp_.cursor_x = clampf(vp_.cursor_x + pm.dx * sensitivity_ / 1920.0f, 0.0f, 1.0f);
             vp_.cursor_y = clampf(vp_.cursor_y + pm.dy * sensitivity_ / 1080.0f, 0.0f, 1.0f);
@@ -292,26 +297,42 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
         if (pm.wheel_x != 0 || pm.wheel_y != 0) {
             backend.send_mouse_wheel(static_cast<int16_t>(pm.wheel_x), static_cast<int16_t>(pm.wheel_y));
         }
-        uint32_t diff = pm.buttons ^ prev_phys_mouse_btns_;
-        if (diff) {
+    }
+
+    uint32_t cur_btns = pm.active ? pm.buttons : 0;
+    uint32_t diff = cur_btns ^ prev_phys_mouse_btns_;
+    if (diff) {
+        // Clicking the top-left '+ 菜单' pill with Joy-Con 2 mouse or USB mouse opens the overlay menu!
+        if ((diff & 1u) && (cur_btns & 1u)) {
+            int sx = vp_.dst_rect.x + static_cast<int>(vp_.cursor_x * vp_.dst_rect.w);
+            int sy = vp_.dst_rect.y + static_cast<int>(vp_.cursor_y * vp_.dst_rect.h);
+            if (sx >= menu_pill.x && sx < menu_pill.x + menu_pill.w &&
+                sy >= menu_pill.y && sy < menu_pill.y + menu_pill.h) {
+                prev_phys_mouse_btns_ = cur_btns;
+                open_menu = true;
+            }
+        }
+        if (!open_menu) {
             static constexpr MouseBtn map[5] = {
                 MouseBtn::LEFT, MouseBtn::RIGHT, MouseBtn::MIDDLE, MouseBtn::BACK, MouseBtn::FORWARD
             };
             for (int i = 0; i < 5; ++i) {
-                if (diff & (1u << i)) backend.send_mouse_button(map[i], (pm.buttons & (1u << i)) != 0);
+                if (diff & (1u << i)) backend.send_mouse_button(map[i], (cur_btns & (1u << i)) != 0);
             }
-            prev_phys_mouse_btns_ = pm.buttons;
+            prev_phys_mouse_btns_ = cur_btns;
         }
     }
+
     for (const auto& k : pkeys) backend.send_key(k.hid_usage, k.pressed, k.modifiers);
 
-    if (!pad) return;
+    if (!pad) return open_menu;
 
     float lx = apply_stick_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX));
     float ly = apply_stick_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY));
-    bool sniper = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    bool sniper = !pm.joycon_mouse && (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0);
     float base_speed = sniper ? 0.22f : 0.92f;
     if (lx != 0.0f || ly != 0.0f) {
+        hw_mouse_visible_ = true;
         vp_.cursor_x += lx * base_speed * sensitivity_ * dt_sec;
         vp_.cursor_y += ly * base_speed * sensitivity_ * dt_sec;
         send_cursor(backend);
@@ -331,8 +352,10 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
     bool a_now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     bool b_now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
     bool bs_now = SDL_GameControllerGetButton(pad, bs_btn) != 0;
-    bool zr_now = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000;
-    bool zl_now = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000;
+    // While Joy-Con 2 optical mouse is engaged on a surface, R = Left Click and ZR = Right Click via Nmouse,
+    // so suppress gamepad ZR/ZL triggers to avoid firing Left+Right simultaneously on ZR!
+    bool zr_now = !pm.joycon_mouse && (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000);
+    bool zl_now = !pm.joycon_mouse && (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000);
 
     if ((a_now || zr_now) != (pad_a_down_ || pad_zr_down_)) {
         backend.send_mouse_button(MouseBtn::LEFT, a_now || zr_now);
@@ -355,6 +378,7 @@ void InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
 
     pad_a_down_ = a_now; pad_b_down_ = b_now; pad_bs_down_ = bs_now;
     pad_zr_down_ = zr_now; pad_zl_down_ = zl_now;
+    return open_menu;
 }
 
 void InputMapper::sync_pad_buttons(SDL_GameController* pad) {

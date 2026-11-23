@@ -19,6 +19,7 @@ bool g_nifm_ok = false;
 bool g_pl_ok = false;
 bool g_kbd_ok = false;
 bool g_mouse_ok = false;
+bool g_nmouse_ok = false;
 PlFontData g_shared_font{};
 bool g_has_shared_font = false;
 std::mutex g_log_mu;
@@ -27,6 +28,19 @@ HidKeyboardState g_prev_kbd{};
 HidMouseState g_prev_mouse{};
 bool g_has_prev_kbd = false;
 bool g_has_prev_mouse = false;
+
+#ifdef __SWITCH2__
+struct NmouseTrack {
+    u64 handle = 0;
+    u64 sampling_number = 0;
+    u32 buttons = 0;
+};
+NmouseTrack g_nm_tracks[16]{};
+int g_nm_track_count = 0;
+bool g_jcmouse_engaged = false;
+u64 g_jcmouse_handle = 0;
+uint64_t g_jcmouse_last_move_us = 0;
+#endif
 }  // namespace
 
 void log_line(const std::string& msg) {
@@ -68,12 +82,41 @@ bool init() {
     hidInitializeMouse();
     g_mouse_ok = true;
 
-    log_line("=== OunceDesk started (Switch 2 kaiHEN, shared_font=" + std::string(g_has_shared_font ? "yes" : "no") + ") ===");
+#ifdef __SWITCH2__
+    if (R_SUCCEEDED(hidInitializeNmouse(nullptr, 0, 1920, 1080, HidNmousePointerType_Default))) {
+        g_nmouse_ok = true;
+        // Right Joy-Con 2 mouse button layout (held side-down on desk like a real optical mouse):
+        //   selectors[0] (0x80  = R, index finger)     -> 1 (HidMouseButton_Left  = 左键点击/拖拽)
+        //   selectors[1] (0x200 = ZR, middle finger)   -> 2 (HidMouseButton_Right = 右键菜单)
+        //   selectors[6] (0x20  = StickR press, thumb) -> 3 (HidMouseButton_Middle = 中键点击)
+        HidNmouseButtonConfigJoyRightJcms rcfg{};
+        rcfg.selectors[0] = 1;
+        rcfg.selectors[1] = 2;
+        rcfg.selectors[6] = 3;
+        hidSetNmouseButtonConfigJoyRightJcms(&rcfg);
+
+        // Left Joy-Con 2 mouse button layout (L = Left Click, ZL = Right Click, StickL = Middle Click):
+        HidNmouseButtonConfigJoyLeftJcms lcfg{};
+        lcfg.selectors[0] = 1;
+        lcfg.selectors[1] = 2;
+        lcfg.selectors[6] = 3;
+        hidSetNmouseButtonConfigJoyLeftJcms(&lcfg);
+    }
+#endif
+
+    log_line("=== OunceDesk started (Switch 2 kaiHEN, shared_font=" + std::string(g_has_shared_font ? "yes" : "no") +
+             ", joycon_nmouse=" + std::string(g_nmouse_ok ? "yes" : "no") + ") ===");
     return g_socket_ok;
 }
 
 void shutdown() {
     log_line("=== OunceDesk shutdown ===");
+#ifdef __SWITCH2__
+    if (g_nmouse_ok) {
+        hidFinalizeNmouse();
+        g_nmouse_ok = false;
+    }
+#endif
     if (g_pl_ok) {
         plExit();
         g_pl_ok = false;
@@ -177,21 +220,128 @@ void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTra
                 g_prev_mouse = st;
                 g_has_prev_mouse = true;
             }
-            out_mouse.active = (st.attributes & HidMouseAttribute_IsConnected) != 0;
-            out_mouse.dx = st.delta_x;
-            out_mouse.dy = st.delta_y;
-            out_mouse.wheel_x = st.wheel_delta_x * 120;
-            out_mouse.wheel_y = st.wheel_delta_y * 120;
-            uint32_t b = 0;
-            if (st.buttons & HidMouseButton_Left)    b |= (1u << 0);
-            if (st.buttons & HidMouseButton_Right)   b |= (1u << 1);
-            if (st.buttons & HidMouseButton_Middle)  b |= (1u << 2);
-            if (st.buttons & HidMouseButton_Back)    b |= (1u << 3);
-            if (st.buttons & HidMouseButton_Forward) b |= (1u << 4);
-            out_mouse.buttons = b;
+            bool usb_conn = (st.attributes & HidMouseAttribute_IsConnected) != 0;
+            if (usb_conn) {
+                out_mouse.active = true;
+                if (st.sampling_number != g_prev_mouse.sampling_number) {
+                    out_mouse.dx += st.delta_x;
+                    out_mouse.dy += st.delta_y;
+                    out_mouse.wheel_x += st.wheel_delta_x * 120;
+                    out_mouse.wheel_y += st.wheel_delta_y * 120;
+                }
+                uint32_t b = 0;
+                if (st.buttons & HidMouseButton_Left)    b |= (1u << 0);
+                if (st.buttons & HidMouseButton_Right)   b |= (1u << 1);
+                if (st.buttons & HidMouseButton_Middle)  b |= (1u << 2);
+                if (st.buttons & HidMouseButton_Back)    b |= (1u << 3);
+                if (st.buttons & HidMouseButton_Forward) b |= (1u << 4);
+                out_mouse.buttons |= b;
+            }
             g_prev_mouse = st;
         }
     }
+
+#ifdef __SWITCH2__
+    if (g_nmouse_ok) {
+        HidNmouseHandle handles[16]{};
+        s32 hcount = 0;
+        if (R_SUCCEEDED(hidGetAllNmouseHandles(handles, 16, &hcount)) && hcount > 0) {
+            NmouseTrack next_tracks[16]{};
+            int next_count = 0;
+            uint64_t now = now_us();
+            bool active_handle_still_present = false;
+
+            // Scan detached Joy-Con 2 mouse sensors (Right Joy-Con prioritized if both move simultaneously)
+            for (s32 pass = 0; pass < 2; ++pass) {
+                for (s32 i = 0; i < hcount && next_count < 16; ++i) {
+                    u32 tset = 0;
+                    if (R_FAILED(hidGetNmouseTypeSet(handles[i], &tset))) continue;
+                    bool is_right = (tset & HidNmouseType_JoyRight) != 0;
+                    if ((pass == 0 && !is_right) || (pass == 1 && is_right)) continue;
+
+                    HidNpadIdType npad_id = HidNpadIdType_Handheld;
+                    if (R_SUCCEEDED(hidGetNmouseNpadIdType(handles[i], &npad_id)) &&
+                        npad_id == HidNpadIdType_Handheld) {
+                        // Attached to console rails in handheld mode -> not sliding on desk as a mouse
+                        continue;
+                    }
+
+                    hidEnableNmousePointer(handles[i], true);
+
+                    const NmouseTrack* prev_t = nullptr;
+                    for (int k = 0; k < g_nm_track_count; ++k) {
+                        if (g_nm_tracks[k].handle == handles[i].handle) {
+                            prev_t = &g_nm_tracks[k];
+                            break;
+                        }
+                    }
+
+                    HidNmouseStateWithDelta states[16]{};
+                    size_t total = 0;
+                    if (R_FAILED(hidGetNmouseStatesWithDelta(handles[i], states, 16, &total)) || total == 0) {
+                        continue;
+                    }
+
+                    s32 s_dx = 0, s_dy = 0;
+                    bool sensor_tracked = false;
+                    if (prev_t) {
+                        for (size_t s = total; s-- > 0;) {
+                            const auto& st = states[s];
+                            if (st.sampling_number <= prev_t->sampling_number) continue;
+                            s_dx += st.delta_x;
+                            s_dy += st.delta_y;
+                            if ((st.flags & 2u) != 0 && (st.delta_x != 0 || st.delta_y != 0)) {
+                                sensor_tracked = true;
+                            }
+                        }
+                    }
+
+                    NmouseTrack cur_t{handles[i].handle, states[0].sampling_number, states[0].buttons};
+                    next_tracks[next_count++] = cur_t;
+
+                    if (sensor_tracked) {
+                        if (!g_jcmouse_engaged || g_jcmouse_handle != handles[i].handle) {
+                            log_line(std::string("[HID] Joy-Con 2 optical mouse engaged (") +
+                                     (is_right ? "Right Joy-Con" : "Left Joy-Con") + ")");
+                        }
+                        g_jcmouse_engaged = true;
+                        g_jcmouse_handle = handles[i].handle;
+                        g_jcmouse_last_move_us = now;
+                    }
+
+                    if (g_jcmouse_engaged && g_jcmouse_handle == handles[i].handle) {
+                        active_handle_still_present = true;
+                        bool sensor_on_surface = (states[0].flags & 2u) != 0;
+                        if (sensor_on_surface || states[0].buttons != 0) {
+                            g_jcmouse_last_move_us = now;
+                        }
+                        // Auto-disengage 2.5s after lifting Joy-Con off the desk back into handheld/air grip
+                        if (!sensor_on_surface && states[0].buttons == 0 &&
+                            now - g_jcmouse_last_move_us > 2500000ULL) {
+                            g_jcmouse_engaged = false;
+                        } else {
+                            out_mouse.active = true;
+                            out_mouse.joycon_mouse = true;
+                            out_mouse.dx += s_dx;
+                            out_mouse.dy += s_dy;
+                            if (states[0].buttons & HidMouseButton_Left)   out_mouse.buttons |= (1u << 0);
+                            if (states[0].buttons & HidMouseButton_Right)  out_mouse.buttons |= (1u << 1);
+                            if (states[0].buttons & HidMouseButton_Middle) out_mouse.buttons |= (1u << 2);
+                        }
+                    }
+                }
+            }
+            std::memcpy(g_nm_tracks, next_tracks, sizeof(NmouseTrack) * static_cast<size_t>(next_count));
+            g_nm_track_count = next_count;
+            if (!active_handle_still_present) {
+                g_jcmouse_engaged = false;
+            }
+        } else {
+            g_nm_track_count = 0;
+            g_jcmouse_engaged = false;
+        }
+    }
+#endif
 
     if (g_kbd_ok) {
         HidKeyboardState st{};

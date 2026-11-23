@@ -133,6 +133,9 @@ int main(int argc, char* argv[]) {
     bool show_manage = false;
     bool show_wg = false;
     bool touch_block = false;  // after a modal keyboard: ignore touch until all fingers lifted
+    float ui_mx = 960.0f, ui_my = 540.0f;
+    bool ui_mouse_visible = false;
+    uint32_t prev_ui_mbtns = 0;
     int manage_focus = 0;
     int wg_focus = 0;
     std::string saved_wg_name;
@@ -678,6 +681,7 @@ int main(int argc, char* argv[]) {
                             }
                         }
                     } else {
+                        ui_mouse_visible = false;
                         dispatch_ui_tap(tx, ty);
                     }
                 } else if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
@@ -945,7 +949,52 @@ int main(int argc, char* argv[]) {
         }
 
         if (mode == AppMode::STREAMING && backend && !show_overlay && !show_osk) {
-            input.update_frame(dt, pad, *backend);
+            if (input.update_frame(dt, pad, *backend, menu_pill)) {
+                show_overlay = true;
+                overlay_focus = 0;
+                ui_mx = input.viewport().dst_rect.x + input.viewport().cursor_x * input.viewport().dst_rect.w;
+                ui_my = input.viewport().dst_rect.y + input.viewport().cursor_y * input.viewport().dst_rect.h;
+                ui_mouse_visible = true;
+                prev_ui_mbtns = 1u;  // wait for release before clicking inside overlay
+            }
+        } else {
+            // Poll Switch 2 Right Joy-Con 2 optical mouse (and USB mouse) across Home / Form / Menu screens too!
+            platform::PhysicalMouseDelta ui_pm{};
+            std::vector<platform::PhysicalKeyTransition> ui_keys;
+            platform::poll_physical_hid(ui_pm, ui_keys);
+            if (ui_pm.active) {
+                if (ui_pm.dx != 0 || ui_pm.dy != 0 || ui_pm.buttons != 0 || ui_pm.joycon_mouse) {
+                    ui_mouse_visible = true;
+                }
+                if (ui_pm.dx != 0 || ui_pm.dy != 0) {
+                    ui_mx = std::max(0.0f, std::min(static_cast<float>(LOGICAL_W - 1), ui_mx + ui_pm.dx * input.sensitivity()));
+                    ui_my = std::max(0.0f, std::min(static_cast<float>(LOGICAL_H - 1), ui_my + ui_pm.dy * input.sensitivity()));
+                    if (slider_dragging && (ui_pm.buttons & 1u) && (show_home_menu || show_overlay)) {
+                        drag_slider_to(static_cast<int>(ui_mx));
+                    }
+                }
+                bool now_l = (ui_pm.buttons & 1u) != 0;
+                bool was_l = (prev_ui_mbtns & 1u) != 0;
+                bool now_r = (ui_pm.buttons & 2u) != 0;
+                bool was_r = (prev_ui_mbtns & 2u) != 0;
+                if (now_l && !was_l) {
+                    dispatch_ui_tap(static_cast<int>(ui_mx), static_cast<int>(ui_my));
+                } else if (!now_l && was_l && slider_dragging) {
+                    slider_dragging = false;
+                    save_settings();
+                }
+                if (now_r && !was_r) {
+                    if (show_overlay) show_overlay = false;
+                    else if (show_osk) show_osk = false;
+                    else if (show_wg) show_wg = false;
+                    else if (show_manage) show_manage = false;
+                    else if (show_home_menu) show_home_menu = false;
+                    else if (mode == AppMode::FORM) mode = AppMode::BROWSER;
+                }
+                prev_ui_mbtns = ui_pm.buttons;
+            } else {
+                prev_ui_mbtns = 0;
+            }
         }
 
         // Deferred verification for fast double-click/tap (<450ms) when remote I-beam PDU was still in flight:
@@ -1006,7 +1055,7 @@ int main(int argc, char* argv[]) {
                 ui.draw_text(LOGICAL_W / 2 - 260, LOGICAL_H / 2 - 12, wait_msg, {200, 215, 235, 255}, 2);
             }
 
-            if (input.touch_mode() == TouchMode::MOUSE) {
+            if (input.show_local_cursor()) {
                 ui.render_cursor(input.viewport());
             }
             menu_pill = ui.render_menu_pill(LOGICAL_W, LOGICAL_H);
@@ -1018,6 +1067,14 @@ int main(int argc, char* argv[]) {
             } else if (show_osk) {
                 active_osk = ui.render_osk(LOGICAL_W, LOGICAL_H, active_profile.protocol, osk_sticky_mods, osk_focus);
             }
+        }
+
+        if ((mode != AppMode::STREAMING || show_overlay || show_osk) && ui_mouse_visible) {
+            ViewportState uivp{};
+            uivp.dst_rect = {0, 0, LOGICAL_W, LOGICAL_H};
+            uivp.cursor_x = ui_mx / static_cast<float>(LOGICAL_W);
+            uivp.cursor_y = ui_my / static_cast<float>(LOGICAL_H);
+            ui.render_cursor(uivp);
         }
 
         SDL_RenderPresent(renderer);
