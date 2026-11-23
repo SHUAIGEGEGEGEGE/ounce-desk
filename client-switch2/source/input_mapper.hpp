@@ -90,6 +90,9 @@ private:
     bool direct_dragging_ = false;
 
     uint32_t prev_phys_mouse_btns_ = 0;
+    float wheel_acc_x_ = 0.0f;
+    float wheel_acc_y_ = 0.0f;
+    float wheel_hold_sec_ = 0.0f;
     bool pad_a_down_ = false;
     bool pad_b_down_ = false;
     bool pad_bs_down_ = false;

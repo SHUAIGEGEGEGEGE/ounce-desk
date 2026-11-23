@@ -356,15 +356,38 @@ void VncBackend::send_mouse_button(MouseBtn btn, bool pressed) {
 }
 
 void VncBackend::send_mouse_wheel(int16_t dx, int16_t dy) {
-    // RFB pointer wheel: button 4=up (bit 3), 5=down (bit 4), 6=left (bit 5), 7=right (bit 6)
-    auto pulse = [&](uint8_t bit) {
-        send_pointer(last_x_, last_y_, static_cast<uint8_t>(btn_mask_ | bit));
-        send_pointer(last_x_, last_y_, btn_mask_);
+    if (state_.load() != BackendState::STREAMING) return;
+    // RFB pointer wheel: button 4=up (bit 3), 5=down (bit 4), 6=left (bit 5), 7=right (bit 6).
+    // Batch multiple ticks into a single TCP send so webpage scrolling on macOS is fast and smooth!
+    wheel_acc_x_ += dx;
+    wheel_acc_y_ += dy;
+    constexpr int STEP = 26;
+    int ticks_y = std::max(-14, std::min(14, wheel_acc_y_ / STEP));
+    int ticks_x = std::max(-10, std::min(10, wheel_acc_x_ / STEP));
+    wheel_acc_y_ -= ticks_y * STEP;
+    wheel_acc_x_ -= ticks_x * STEP;
+    if (ticks_y == 0 && ticks_x == 0) return;
+
+    std::vector<uint8_t> batch;
+    batch.reserve(static_cast<size_t>(std::abs(ticks_y) + std::abs(ticks_x)) * 12);
+    auto append_pulse = [&](uint8_t bit, int count) {
+        for (int i = 0; i < count; ++i) {
+            uint8_t m_dn[6] = {5, static_cast<uint8_t>(btn_mask_ | bit), 0, 0, 0, 0};
+            uint8_t m_up[6] = {5, btn_mask_, 0, 0, 0, 0};
+            put_be16(m_dn + 2, last_x_); put_be16(m_dn + 4, last_y_);
+            put_be16(m_up + 2, last_x_); put_be16(m_up + 4, last_y_);
+            batch.insert(batch.end(), m_dn, m_dn + 6);
+            batch.insert(batch.end(), m_up, m_up + 6);
+        }
     };
-    if (dy > 20) pulse(1 << 3);
-    else if (dy < -20) pulse(1 << 4);
-    if (dx < -20) pulse(1 << 5);
-    else if (dx > 20) pulse(1 << 6);
+    if (ticks_y > 0) append_pulse(1 << 3, ticks_y);
+    else if (ticks_y < 0) append_pulse(1 << 4, -ticks_y);
+    if (ticks_x < 0) append_pulse(1 << 5, -ticks_x);
+    else if (ticks_x > 0) append_pulse(1 << 6, ticks_x);
+
+    if (!batch.empty()) {
+        send_all(batch.data(), batch.size());
+    }
 }
 
 void VncBackend::send_key(uint16_t hid_usage, bool pressed, uint8_t modifiers) {

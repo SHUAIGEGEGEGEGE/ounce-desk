@@ -2016,18 +2016,23 @@ void RdpBackend::send_mouse_button(MouseBtn btn, bool pressed) {
 }
 
 void RdpBackend::send_mouse_wheel(int16_t dx, int16_t dy) {
-    auto send_w = [&](uint16_t base_flag, int delta) {
-        if (delta == 0) return;
-        uint16_t flags = base_flag;
-        int mag = std::min(255, std::abs(delta));
-        if (delta < 0) flags |= 0x0100u | static_cast<uint16_t>(((-mag) & 0xFF));
-        else flags |= static_cast<uint16_t>(mag & 0xFF);
-        std::vector<uint8_t> ev;
-        ev.push_back(static_cast<uint8_t>(1 << 5));
-        push_le16(ev, flags);
-        push_le16(ev, last_x_);
-        push_le16(ev, last_y_);
-        send_fastpath_input(ev.data(), ev.size());
+    auto send_w = [&](uint16_t base_flag, int rem) {
+        while (rem != 0) {
+            int delta = std::max(-240, std::min(240, rem));
+            rem -= delta;
+            uint16_t flags = base_flag;
+            if (delta < 0) flags |= 0x0100u | static_cast<uint16_t>((delta) & 0xFF);
+            else flags |= static_cast<uint16_t>(delta & 0xFF);
+            uint8_t ev[7];
+            ev[0] = static_cast<uint8_t>(1 << 5);
+            ev[1] = uint8_t(flags & 0xFF);
+            ev[2] = uint8_t(flags >> 8);
+            ev[3] = uint8_t(last_x_ & 0xFF);
+            ev[4] = uint8_t(last_x_ >> 8);
+            ev[5] = uint8_t(last_y_ & 0xFF);
+            ev[6] = uint8_t(last_y_ >> 8);
+            send_fastpath_input(ev, sizeof(ev));
+        }
     };
     if (dy != 0) send_w(0x0200u, dy);  // PTRFLAGS_WHEEL
     if (dx != 0) send_w(0x0400u, dx);  // PTRFLAGS_HWHEEL

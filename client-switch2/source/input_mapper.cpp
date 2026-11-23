@@ -15,6 +15,15 @@ float apply_stick_curve(int16_t raw) {
     float curved = scaled * (0.35f + 0.65f * scaled * scaled);
     return (n < 0.0f) ? -curved : curved;
 }
+float apply_scroll_curve(int16_t raw) {
+    float n = static_cast<float>(raw) / 32767.0f;
+    constexpr float deadzone = 0.12f;
+    float mag = std::fabs(n);
+    if (mag < deadzone) return 0.0f;
+    float s = (mag - deadzone) / (1.0f - deadzone);
+    float curved = s * (0.45f + 0.55f * s);
+    return (n < 0.0f) ? -curved : curved;
+}
 }  // namespace
 
 void InputMapper::update_viewport_rect(int win_w, int win_h, int fb_w, int fb_h) {
@@ -294,7 +303,8 @@ bool InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
             vp_.cursor_y = clampf(vp_.cursor_y + pm.dy * sensitivity_ / 1080.0f, 0.0f, 1.0f);
             send_cursor(backend);
         }
-        if (pm.wheel_x != 0 || pm.wheel_y != 0) {
+        // Apply USB mouse wheel directly; Joy-Con Nmouse wheel is used as fallback if SDL stick axis isn't active
+        if (!pm.joycon_mouse && (pm.wheel_x != 0 || pm.wheel_y != 0)) {
             backend.send_mouse_wheel(static_cast<int16_t>(pm.wheel_x), static_cast<int16_t>(pm.wheel_y));
         }
     }
@@ -325,7 +335,12 @@ bool InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
 
     for (const auto& k : pkeys) backend.send_key(k.hid_usage, k.pressed, k.modifiers);
 
-    if (!pad) return open_menu;
+    if (!pad) {
+        if (pm.joycon_mouse && pm.wheel_y != 0) {
+            backend.send_mouse_wheel(0, static_cast<int16_t>(pm.wheel_y));
+        }
+        return open_menu;
+    }
 
     float lx = apply_stick_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX));
     float ly = apply_stick_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY));
@@ -338,12 +353,33 @@ bool InputMapper::update_frame(float dt_sec, SDL_GameController* pad, RemoteBack
         send_cursor(backend);
     }
 
-    float rx = apply_stick_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX));
-    float ry = apply_stick_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY));
+    // Fast webpage scrolling on Right Stick (with hold momentum boost + sub-frame float accumulator!)
+    float rx = apply_scroll_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX));
+    float ry = apply_scroll_curve(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY));
     if (rx != 0.0f || ry != 0.0f) {
-        int16_t wx = static_cast<int16_t>(rx * 220.0f * dt_sec * 10.0f);
-        int16_t wy = static_cast<int16_t>(-ry * 260.0f * dt_sec * 10.0f);
-        if (wx != 0 || wy != 0) backend.send_mouse_wheel(wx, wy);
+        if (std::fabs(ry) > 0.6f || std::fabs(rx) > 0.6f) {
+            wheel_hold_sec_ = std::min(1.0f, wheel_hold_sec_ + dt_sec);
+        } else {
+            wheel_hold_sec_ = std::max(0.0f, wheel_hold_sec_ - dt_sec * 2.0f);
+        }
+        float boost = 1.0f + 1.15f * wheel_hold_sec_;  // ramps smoothly up to 2.15x when held!
+        float sens_scale = 0.65f + 0.35f * sensitivity_;
+        wheel_acc_x_ += rx * 6800.0f * boost * sens_scale * dt_sec;
+        wheel_acc_y_ += -ry * 9800.0f * boost * sens_scale * dt_sec;
+        int16_t wx = static_cast<int16_t>(wheel_acc_x_);
+        int16_t wy = static_cast<int16_t>(wheel_acc_y_);
+        if (wx != 0 || wy != 0) {
+            wheel_acc_x_ -= wx;
+            wheel_acc_y_ -= wy;
+            backend.send_mouse_wheel(wx, wy);
+        }
+    } else {
+        wheel_hold_sec_ = 0.0f;
+        wheel_acc_x_ = 0.0f;
+        wheel_acc_y_ = 0.0f;
+        if (pm.joycon_mouse && pm.wheel_y != 0) {
+            backend.send_mouse_wheel(0, static_cast<int16_t>(pm.wheel_y * 3));
+        }
     }
 
     const auto bs_btn = platform::is_switch_hardware()

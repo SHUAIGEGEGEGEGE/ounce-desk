@@ -282,7 +282,7 @@ void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTra
                         continue;
                     }
 
-                    s32 s_dx = 0, s_dy = 0;
+                    s32 s_dx = 0, s_dy = 0, s_wy = 0;
                     bool sensor_tracked = false;
                     if (prev_t) {
                         for (size_t s = total; s-- > 0;) {
@@ -290,6 +290,7 @@ void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTra
                             if (st.sampling_number <= prev_t->sampling_number) continue;
                             s_dx += st.delta_x;
                             s_dy += st.delta_y;
+                            s_wy += st.wheel_delta_y;
                             if ((st.flags & 2u) != 0 && (st.delta_x != 0 || st.delta_y != 0)) {
                                 sensor_tracked = true;
                             }
@@ -312,7 +313,7 @@ void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTra
                     if (g_jcmouse_engaged && g_jcmouse_handle == handles[i].handle) {
                         active_handle_still_present = true;
                         bool sensor_on_surface = (states[0].flags & 2u) != 0;
-                        if (sensor_on_surface || states[0].buttons != 0) {
+                        if (sensor_on_surface || states[0].buttons != 0 || s_wy != 0) {
                             g_jcmouse_last_move_us = now;
                         }
                         // Auto-disengage 2.5s after lifting Joy-Con off the desk back into handheld/air grip
@@ -324,6 +325,7 @@ void poll_physical_hid(PhysicalMouseDelta& out_mouse, std::vector<PhysicalKeyTra
                             out_mouse.joycon_mouse = true;
                             out_mouse.dx += s_dx;
                             out_mouse.dy += s_dy;
+                            out_mouse.wheel_y += s_wy * 90;
                             if (states[0].buttons & HidMouseButton_Left)   out_mouse.buttons |= (1u << 0);
                             if (states[0].buttons & HidMouseButton_Right)  out_mouse.buttons |= (1u << 1);
                             if (states[0].buttons & HidMouseButton_Middle) out_mouse.buttons |= (1u << 2);

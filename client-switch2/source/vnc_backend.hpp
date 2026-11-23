@@ -57,6 +57,8 @@ private:
     uint16_t sent_y_ = 0xFFFF;
     uint8_t sent_mask_ = 0xFF;
     uint64_t last_ptr_send_us_ = 0;
+    int32_t wheel_acc_x_ = 0;
+    int32_t wheel_acc_y_ = 0;
 
     int fb_w_ = 0;
     int fb_h_ = 0;
